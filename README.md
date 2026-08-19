@@ -1,17 +1,21 @@
 # BACE / Exact Batch-ERV debugging snapshot
 
 This repository is a source-only snapshot prepared to reproduce and diagnose the
-BACE ALFWorld training issue described in
-[`当前问题说明-Exact-Batch-ERV指数爆炸.md`](./当前问题说明-Exact-Batch-ERV指数爆炸.md).
+BACE ALFWorld training issue documented in the design and audit notes under
+[`BACE-work-2/`](./BACE-work-2/) and [`issues/`](./issues/).
 
-## Current blocker
+## Stability-run failure and current fix
 
 During a 4×H100 stability run, training completed steps 1 and 2 but stalled in
-step 3 before branch replay. The current Exact Batch-ERV implementation builds
-the Cartesian product of all per-anchor allocations and only then filters by the
-global branch quota. In the captured case, a task with quota 1 and 26 usable
-anchors caused approximately 1.69 trillion candidate states to be enumerated,
-although only 26 single-branch allocations were feasible.
+step 3 before branch replay. The previous Exact Batch-ERV implementation
+enumerated the Cartesian product of all per-anchor allocations before filtering
+by the global branch quota. In the captured case, a task with quota 1 and 26
+usable anchors caused approximately 1.69 trillion candidate states to be
+enumerated, although only 26 single-branch allocations were feasible.
+
+The current snapshot contains quota-aware planning and regression tests for this
+failure mode. The formal H100 chain should still be rerun after the focused tests
+and a fresh stability profile pass.
 
 The relevant implementation is:
 
@@ -54,6 +58,5 @@ From `verl-agent-src/`, with the project dependencies available:
 pytest -q tests/bace_gigpo
 ```
 
-The issue document contains the observed runtime evidence, failure location, and
-a proposed quota-aware dynamic-programming replacement that preserves Exact
-Batch-ERV tie semantics.
+The BACE design notes contain the algorithm details, runtime evidence, and the
+quota-aware replacement that preserves Exact Batch-ERV tie semantics.
