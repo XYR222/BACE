@@ -1,0 +1,59 @@
+{
+  "date": "2026-08-09",
+  "model": "/opt/dpcvol/datasets/8165423358032568398/model/Qwen2.5-1.5B-Instruct",
+  "environment": {
+    "device": "Ascend 910B3",
+    "torch_npu": "2.8.0.post2",
+    "transformers": "4.57.3",
+    "vllm": "0.13.0+empty",
+    "vllm_ascend": "0.13.0"
+  },
+  "training_trace_strict_four_steps": {
+    "occurrence_count": 178,
+    "valid_token_count": 16655,
+    "mean_abs_log_prob_diff": 0.02390469190267029,
+    "median_abs_log_prob_diff": 0.004839271306991577,
+    "p95_abs_log_prob_diff": 0.1054928541183471,
+    "p99_abs_log_prob_diff": 0.16538476943969727,
+    "max_abs_log_prob_diff": 0.5796535015106201,
+    "mean_signed_recomputed_minus_rollout": -0.001150230802858778,
+    "positive_signed_fraction": 0.4860402281597118,
+    "correlation_abs_diff_response_length": -0.007172580381561201,
+    "correlation_abs_diff_absolute_position": -0.04884830396524445,
+    "correlation_abs_diff_normalized_position": -0.08521018495660211,
+    "correlation_abs_diff_rollout_log_prob": -0.4537411569518864,
+    "matched_root_branch_origin_pairs": 16,
+    "matched_pair_token_mask_rollout_recomputed_max_diff": 0.0
+  },
+  "fixed_backend_three_way": {
+    "token_count": 64,
+    "vllm_bf16_vs_transformers_bf16": {
+      "mean_abs_log_diff": 0.02345052203700959,
+      "p95_abs_log_diff": 0.083118337392807,
+      "max_abs_log_diff": 0.14459729194641113,
+      "mean_abs_probability_diff": 0.0062069182586359,
+      "max_abs_probability_diff": 0.028385941442435003
+    },
+    "vllm_bf16_vs_transformers_fp32": {
+      "mean_abs_log_diff": 0.024406379611846774,
+      "p95_abs_log_diff": 0.09874618649482723,
+      "max_abs_log_diff": 0.12860465049743652,
+      "mean_abs_probability_diff": 0.005417205135039517,
+      "max_abs_probability_diff": 0.03474440685744756
+    },
+    "transformers_bf16_vs_transformers_fp32": {
+      "mean_abs_log_diff": 0.023249931205072016,
+      "p95_abs_log_diff": 0.08573833703994743,
+      "max_abs_log_diff": 0.163130521774292,
+      "mean_abs_probability_diff": 0.006048163681216485,
+      "max_abs_probability_diff": 0.023888993506034017
+    }
+  },
+  "transformers_cache_control": {
+    "attention_implementation": "sdpa",
+    "token_count": 52,
+    "full_no_cache_vs_full_cache_max_abs_log_diff": 0.0,
+    "full_no_cache_vs_incremental_cache_max_abs_log_diff": 0.0
+  },
+  "conclusion": "The observed baseline discrepancy is reproduced without BACE, Replay, FSDP sharding, or training weight synchronization. It is caused at engineering level by different BF16 numerical execution paths in vLLM Ascend and Transformers/SDPA. A single responsible kernel has not yet been isolated."
+}

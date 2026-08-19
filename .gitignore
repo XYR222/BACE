@@ -1,0 +1,92 @@
+# Local experiment products and paper workspace
+/experiments/
+/ICLR2027/
+/target/
+/BACE-work/experiment_traces/
+
+# Keep this public snapshot focused on the BACE/ALFWorld debugging path rather
+# than mirroring every unrelated component from the migrated upstream tree.
+/verl-agent-src/.github/
+/verl-agent-src/docker/
+/verl-agent-src/docs/
+/verl-agent-src/scripts/
+/verl-agent-src/recipe/*
+!/verl-agent-src/recipe/bace_gigpo/
+/verl-agent-src/examples/*
+!/verl-agent-src/examples/bace_gigpo/
+!/verl-agent-src/examples/gigpo_trainer/
+/verl-agent-src/tests/*
+!/verl-agent-src/tests/bace_gigpo/
+!/verl-agent-src/tests/trainer/
+/verl-agent-src/tests/trainer/*
+!/verl-agent-src/tests/trainer/ppo/
+/verl-agent-src/tests/trainer/ppo/*
+!/verl-agent-src/tests/trainer/ppo/test_metric_utils.py
+/verl-agent-src/agent_system/environments/env_package/*
+!/verl-agent-src/agent_system/environments/env_package/alfworld/
+/verl-agent-src/agent_system/environments/env_package/alfworld/alfworld/gen/layouts/*.npy
+/verl-agent-src/agent_system/environments/env_package/alfworld/alfworld/gen/planner/pddl.pdf
+
+# Runtime output
+**/outputs/
+**/wandb/
+**/checkpoints/
+**/tensorboard*/
+**/logs/
+**/*.log
+**/*.out
+**/*.err
+**/*.pid
+**/*.lock
+
+# Crash dumps and profiling products
+**/core
+**/core.*
+**/*.prof
+**/*.trace
+
+# Python caches, test caches, and packaging products
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/htmlcov/
+**/*.egg-info/
+**/build/
+**/dist/
+
+# Local environments and editor state
+/.venv/
+/venv/
+/env/
+/conda-env/
+**/.vscode/
+**/.idea/
+**/.DS_Store
+**/*.swp
+
+# Secrets and machine-local configuration
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*credentials*
+
+# External training assets (never vendor models or datasets here)
+/model_down/
+/models/
+/data/
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/*.parquet
+
+# Temporary and backup files
+**/tmp/
+**/.tmp/
+**/*.tmp
+**/*.bak
+**/*.bak_*
+**/*~

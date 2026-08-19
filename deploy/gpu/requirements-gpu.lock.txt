@@ -1,0 +1,13 @@
+# CUDA/H100 runtime selected from the current upstream verl-agent README.
+# vLLM 0.11.0 installs its compatible CUDA PyTorch build (torch 2.8.0).
+vllm==0.11.0
+torchvision==0.23.0
+torchaudio==2.8.0
+gymnasium==0.29.1
+stable-baselines3==2.6.0
+alfworld==0.4.2
+numpy==1.26.4
+setuptools==80.9.0
+
+# Install separately after torch with --no-build-isolation:
+# flash-attn==2.7.4.post1

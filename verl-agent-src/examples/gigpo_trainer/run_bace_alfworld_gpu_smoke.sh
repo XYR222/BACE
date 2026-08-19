@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+export BACE_RUN_NAME=${BACE_RUN_NAME:-bace_alfworld_h100_smoke_$(date -u +%Y%m%dT%H%M%SZ)}
+export BACE_TOTAL_EPOCHS=${BACE_TOTAL_EPOCHS:-1}
+export TRAIN_DATA_SIZE=${TRAIN_DATA_SIZE:-16}
+export VAL_DATA_SIZE=${VAL_DATA_SIZE:-8}
+export ENV_MAX_STEPS=${ENV_MAX_STEPS:-12}
+export MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-256}
+export ACTOR_MICRO_BATCH=${ACTOR_MICRO_BATCH:-2}
+export LOGPROB_MICRO_BATCH=${LOGPROB_MICRO_BATCH:-2}
+export GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.50}
+export MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
+export MAX_NUM_SEQS=${MAX_NUM_SEQS:-64}
+export SAVE_FREQ=${SAVE_FREQ:--1}
+export TEST_FREQ=${TEST_FREQ:--1}
+
+exec bash "${SCRIPT_DIR}/run_bace_alfworld_gpu.sh" "$@"
