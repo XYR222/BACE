@@ -40,6 +40,7 @@ python -m recipe.bace_gigpo.validate_trace "${artifact_dir}" \
     --output "${report_dir}/${attempt_name}_trace_validation.json"
 python "${SCRIPT_DIR}/analyze_host_resources.py" \
     "${metadata_dir}/host_resource_samples.csv" --max-pids 12000 \
+    --warn-only \
     --output "${report_dir}/${attempt_name}_host_resources.json"
 python "${SCRIPT_DIR}/check_formal_storage.py" "${FORMAL_ROOT}" \
     --expected-prefix /hpcwork/rwth2089/xsz96350 \

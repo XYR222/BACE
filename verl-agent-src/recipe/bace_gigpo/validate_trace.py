@@ -209,6 +209,47 @@ def validate_step(step_dir: Path, max_recomputed_logprob_diff=None,
     acquisition = streams.get("acquisition_rounds", [])
     support = None
     for round_record in acquisition:
+        for diagnostic in round_record.get("diagnostics", []):
+            global_allocation = diagnostic.get("global_allocation")
+            if global_allocation is None:
+                continue
+            task_id = diagnostic.get("task_id", "<unknown>")
+            solver = global_allocation.get("solver")
+            if solver != "quota_aware_exact_dp":
+                errors.append(
+                    f"task {task_id}: unexpected global allocation solver {solver!r}"
+                )
+            selected = global_allocation.get("selected_allocation")
+            quota = global_allocation.get("branch_quota")
+            if not isinstance(selected, dict) or quota is None:
+                errors.append(
+                    f"task {task_id}: incomplete global allocation diagnostics"
+                )
+                continue
+            try:
+                selected_total = sum(int(value) for value in selected.values())
+                expected_quota = int(quota)
+            except (TypeError, ValueError):
+                errors.append(f"task {task_id}: invalid global allocation quota values")
+                continue
+            if selected_total != expected_quota:
+                errors.append(
+                    f"task {task_id}: selected global allocation uses "
+                    f"{selected_total} branches, expected {expected_quota}"
+                )
+            if selected != diagnostic.get("selected_allocation"):
+                errors.append(
+                    f"task {task_id}: selected global allocation diagnostics disagree"
+                )
+            tie_count = global_allocation.get("optimal_tie_count")
+            if not isinstance(tie_count, int) or tie_count < 1:
+                errors.append(f"task {task_id}: invalid global optimal tie count")
+            reachable = global_allocation.get("reachable_state_count")
+            if not isinstance(reachable, int) or reachable < 1:
+                errors.append(f"task {task_id}: invalid reachable DP state count")
+            wall_time = global_allocation.get("solver_wall_time_ms")
+            if not isinstance(wall_time, (int, float)) or not math.isfinite(wall_time):
+                errors.append(f"task {task_id}: invalid global allocator wall time")
         snapshot = round_record.get("posterior_snapshot", {})
         current_support = {
             (task_id, anchor_id, action_id)

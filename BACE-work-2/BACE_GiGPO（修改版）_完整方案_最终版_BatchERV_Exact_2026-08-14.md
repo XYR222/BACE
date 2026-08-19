@@ -1955,6 +1955,11 @@ $$
 }
 $$
 
+主实现使用 quota-aware exact dynamic programming 精确求解。每个 DP state
+保存最优值和最优路径数，并按 predecessor path count 做 seeded backtracking，
+因此无需物化 $\mathfrak M_g^*$ 也能保证对完整最优 allocations 均匀采样。
+旧 Cartesian solver 仅作为小规模测试 oracle。
+
 ---
 
 ## 14.5 Seeded uniform tie-breaking
@@ -2198,17 +2203,20 @@ $$
 
 ---
 
-# 19. All-Leaf Global Trajectory Advantage
+# 19. GiGPO-Compatible Global Trajectory Advantage
 
-## 19.1 Leaf-uniform normalization
+## 19.1 Occurrence-weighted normalization（主配置）
 
-对全部 terminal leaves：
+为保持与当前 GiGPO implementation baseline 的下游 credit estimator 一致，
+主配置对所有真实 trainable decision occurrences 统计 global baseline。设
+$\mathcal I_g$ 为 task $g$ 的 occurrence rows，$\ell(i)$ 是 occurrence $i$
+所属 terminal trajectory：
 
 $$
 \mu_g^E
 =
-\frac1B
-\sum_{\ell\in\mathcal L_g}R_{g,\ell},
+\frac1{|\mathcal I_g|}
+\sum_{i\in\mathcal I_g}R_{g,\ell(i)},
 $$
 
 $$
@@ -2216,7 +2224,7 @@ $$
 =
 \operatorname{Std}
 \left(
-\{R_{g,\ell}\}_{\ell\in\mathcal L_g}
+\{R_{g,\ell(i)}\}_{i\in\mathcal I_g}
 \right).
 $$
 
@@ -2224,9 +2232,9 @@ $$
 
 $$
 \boxed{
-A_{g,\ell}^E
+A_{g,i}^E
 =
-\frac{R_{g,\ell}-\mu_g^E}
+\frac{R_{g,\ell(i)}-\mu_g^E}
 {\sigma_g^E+\epsilon_{\mathrm{norm}}}.
 }
 $$
@@ -2240,8 +2248,13 @@ $$
 则：
 
 $$
-A_{g,\ell}^E=0.
+A_{g,i}^E=0.
 $$
+
+这是一项有意的 baseline-alignment 选择：BACE 主实验改变 rollout evidence 的
+acquisition/topology，但保持 GiGPO macro/local credit 和 PPO optimizer 语义。
+terminal-leaf-uniform normalization 保留为 tree-aware optimization ablation，
+不作为主方法必需组件。
 
 ---
 
@@ -2255,7 +2268,8 @@ $$
 - branch copied origin 和 fresh suffix 作为 branch 新 evidence 训练；
 - descendant branch 数不会把同一 mechanical prefix 梯度放大 $K$ 倍。
 
-主版本采用 leaf-uniform global normalization；lineage-balanced normalization 作为消融。
+主版本采用 GiGPO-compatible occurrence-weighted global normalization；
+leaf-uniform 与 lineage-balanced normalization 作为消融。
 
 ---
 
@@ -2814,14 +2828,15 @@ for each task g with Q[g] > 0:
         cache V^(0)(z), V^(1)(z), V^(2)(z)
         cache all tie-optimal local plans
 
-    solve exactly:
+    solve exactly with quota-aware DP:
         maximize sum_z V^(m_z)(z)
         subject to sum_z m_z = Q[g]
                    m_z in {0,1,2}
                    information-capacity constraints
 
     if multiple global optimum allocations tie:
-        sample uniformly using deterministic seeded RNG
+        count optimal DP paths
+        sample uniformly by count-weighted deterministic seeded backtracking
 
     for every anchor z with m_z > 0:
         if multiple local plans tie:
@@ -2851,8 +2866,8 @@ for each branch in parallel:
 # Phase 6: Build final tree statistics
 # --------------------------------------------------
 for each task g:
-    construct all terminal leaves: roots + branches
-    compute leaf-uniform global A^E
+    construct all terminal trajectories: roots + branches
+    compute GiGPO-compatible occurrence-weighted global A^E
 
     build final exact state groups from trainable occurrences only:
         natural root occurrences

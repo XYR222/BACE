@@ -54,7 +54,7 @@ $$
 | Numerics | $\epsilon_{\mathrm{norm}}$ | advantage 标准化稳定项 | $10^{-6}$ | 不调 | 固定 |
 | Training | behavior correction | 是否乘额外 $\pi_{\rm old}/\mu$ | **False** | corrected 版仅消融 | 固定主方案 |
 | Training | separate branch loss | root/branch 是否分开 loss | **False** | 分开版本仅消融 | 固定主方案 |
-| Credit | leaf weighting | terminal leaves 的全局统计权重 | **uniform** | lineage-balanced | 主配置 |
+| Credit | macro weighting | global trajectory return 的统计权重 | **GiGPO-compatible occurrence-weighted** | leaf-uniform、lineage-balanced | 主配置/消融 |
 | Credit | local credit | 局部 GiGPO credit | **occurrence-level** | action-aggregated | 主配置/增强消融 |
 
 ---
@@ -472,15 +472,19 @@ $$
 
 ---
 
-## 8.2 Global leaf weighting
+## 8.2 Global macro weighting
 
 主版本：
 
 ```text
-leaf_weighting = uniform
+advantage_semantics = gigpo_macro
+macro_weighting = occurrence
 ```
 
-**理由：** 所有 terminal leaves 统一形成完整 rollout group，方法最简单，也让主动 branch allocation 自然改变训练注意力。`lineage-balanced` 保留为消融，用于检查某条 root lineage 因 branch 较多而获得过大统计权重的问题。
+**理由：** 主实验保持当前 GiGPO implementation 的 occurrence-weighted macro
+normalization，使 BACE 与 baseline 的主要控制变量是 rollout evidence 的主动采集。
+`leaf-uniform` 作为 tree-aware optimization 消融保留；`lineage-balanced` 继续用于
+检查某条 root lineage 因 branch 较多而获得过大统计权重的问题。
 
 ---
 

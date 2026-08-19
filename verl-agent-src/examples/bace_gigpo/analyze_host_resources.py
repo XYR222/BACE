@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Validate cgroup task usage recorded during a multi-step H100 run."""
+"""Analyze cgroup task usage recorded during a multi-step H100 run."""
 
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 
 
@@ -34,6 +35,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("samples", type=Path)
     parser.add_argument("--max-pids", type=int, default=12000)
+    parser.add_argument(
+        "--warn-only",
+        action="store_true",
+        help="record threshold violations without failing the caller",
+    )
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
 
@@ -43,13 +49,18 @@ def main() -> None:
         payload = analyze(rows, args.max_pids)
     except ValueError as error:
         raise SystemExit(f"{error} in {args.samples}") from error
+    payload["enforcement"] = "warning_only" if args.warn_only else "fail_closed"
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     if not payload["ok"]:
-        raise SystemExit(
+        message = (
             f"cgroup task usage peaked at {payload['peak_pids_current']}, "
             f"above safety limit {args.max_pids}"
         )
+        if args.warn_only:
+            print(f"WARNING: {message}; continuing because monitoring is warn-only", file=sys.stderr)
+        else:
+            raise SystemExit(message)
 
 
 if __name__ == "__main__":

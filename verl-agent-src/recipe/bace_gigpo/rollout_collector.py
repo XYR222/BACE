@@ -1678,6 +1678,41 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                     if suffix_output is not None:
                         batches.append(suffix_output)
 
+        global_allocation_diagnostics = [
+            diagnostic["global_allocation"]
+            for diagnostic in getattr(self.coordinator, "last_round_diagnostics", [])
+            if "global_allocation" in diagnostic
+        ]
+        if global_allocation_diagnostics:
+            solver_times = np.asarray([
+                item["solver_wall_time_ms"]
+                for item in global_allocation_diagnostics
+            ], dtype=float)
+            self.orchestration_metrics.update({
+                "global_alloc/num_anchors_mean": float(np.mean([
+                    item["num_anchors"] for item in global_allocation_diagnostics
+                ])),
+                "global_alloc/quota_mean": float(np.mean([
+                    item["branch_quota"] for item in global_allocation_diagnostics
+                ])),
+                "global_alloc/total_capacity_mean": float(np.mean([
+                    item["total_information_capacity"]
+                    for item in global_allocation_diagnostics
+                ])),
+                "global_alloc/reachable_states_mean": float(np.mean([
+                    item["reachable_state_count"]
+                    for item in global_allocation_diagnostics
+                ])),
+                "global_alloc/optimal_tie_count_mean": float(np.mean([
+                    item["optimal_tie_count"]
+                    for item in global_allocation_diagnostics
+                ])),
+                "global_alloc/solver_time_ms_mean": float(np.mean(solver_times)),
+                "global_alloc/solver_time_ms_p50": float(np.percentile(solver_times, 50)),
+                "global_alloc/solver_time_ms_p95": float(np.percentile(solver_times, 95)),
+                "global_alloc/solver_time_ms_max": float(np.max(solver_times)),
+            })
+
         topology_metrics = {}
         if topology_plan is not None:
             tasks = list(topology_plan.tasks.values())

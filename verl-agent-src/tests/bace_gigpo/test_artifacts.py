@@ -75,6 +75,21 @@ def build_valid_trace(tmp_path):
     })
     store.append("acquisition_rounds", {
         "round": 1,
+        "diagnostics": [{
+            "task_id": "task-1",
+            "selected_allocation": {"anchor-1": 1},
+            "global_allocation": {
+                "solver": "quota_aware_exact_dp",
+                "num_anchors": 1,
+                "branch_quota": 1,
+                "total_information_capacity": 1,
+                "reachable_state_count": 3,
+                "optimal_value": 0.1,
+                "optimal_tie_count": 1,
+                "selected_allocation": {"anchor-1": 1},
+                "solver_wall_time_ms": 0.1,
+            },
+        }],
         "posterior_snapshot": {"task-1": {"anchor-1": {
             "invalid::bad action": {"alpha": 1, "beta": 1},
             "valid::look": {"alpha": 1, "beta": 1},
@@ -131,6 +146,18 @@ def test_trace_validator_rejects_copied_origin_and_threshold_violations(tmp_path
     assert not result["ok"]
     assert any("copied response token ids" in error for error in result["errors"])
     assert any("exceeds threshold" in error for error in result["errors"])
+
+
+def test_trace_validator_rejects_wrong_global_allocation_quota(tmp_path):
+    step_dir = build_valid_trace(tmp_path)
+    stream = step_dir / "acquisition_rounds.jsonl"
+    record = json.loads(stream.read_text())
+    record["diagnostics"][0]["global_allocation"]["branch_quota"] = 2
+    stream.write_text(json.dumps(record) + "\n")
+
+    result = validate_step(step_dir)
+    assert not result["ok"]
+    assert any("uses 1 branches, expected 2" in error for error in result["errors"])
 
 
 def test_training_diagnostics_tolerates_missing_optional_advantages(tmp_path):

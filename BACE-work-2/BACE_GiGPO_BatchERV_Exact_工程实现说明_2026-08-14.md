@@ -199,7 +199,7 @@ delta(1) = V(1)
 delta(2) = V(2) - V(1)
 ```
 
-容量按层级阈值判断；阈值等号算有效。然后枚举所有：
+容量按层级阈值判断；阈值等号算有效。然后用 quota-aware exact DP 求解：
 
 ```text
 m_z in [0, capacity(z)]
@@ -207,6 +207,9 @@ sum(m_z) = Q
 ```
 
 选择使 `sum_z V_z(m_z)` 最大的精确全局 allocation，不使用 greedy top-Q。
+DP 复杂度为 `O(A * Q * L_max)`，并通过最优路径计数和 count-weighted seeded
+backtracking 对完整最优 allocation 集均匀采样，不展开或保存完整 tie 集。
+旧 Cartesian 枚举只保留为带状态数 hard guard 的小规模测试 oracle。
 
 ### 3.7 Tie-breaking
 
@@ -309,7 +312,7 @@ Exact 路径新增或扩充以下记录：
 | `manifest.json` | variant、budget、threshold、tie tolerances、action identity mode 等完整配置 |
 | `family_topology_plans.jsonl` | history snapshot、family prior、readiness、planned R/Q |
 | `capacity_checks.jsonl` | 每轮 current posterior、anchor designs、V/delta/capacity、deficient tasks、correction count |
-| `acquisition_rounds.jsonl` | 所有 local candidate plans、tie-optimal sets、global allocations、最终 plan |
+| `acquisition_rounds.jsonl` | local candidate plans、local tie sets、global DP 统计、global tie count 与唯一选中的 allocation；不保存完整 global tie set |
 | `replay_attempts.jsonl` | observation/action-set/transition 校验与 retry lineage |
 | `branches.jsonl` | branch origin、action、terminal reward、suffix occurrence IDs |
 | `posterior_snapshots.jsonl` | frozen acquisition posterior 与 realized selected-edge outcomes |
@@ -370,7 +373,7 @@ branch_suffix_generation_seconds
 
 | 文件 | 作用 |
 |---|---|
-| `recipe/bace_gigpo/batch_erv.py` | Beta-Binomial exact BERV、local plans、capacity、global allocation、seeded tie |
+| `recipe/bace_gigpo/batch_erv.py` | Beta-Binomial exact BERV、local plans、capacity、quota-aware exact global DP、count-weighted seeded tie backtracking |
 | `recipe/bace_gigpo/topology.py` | 新的 no-pilot lagged-family planner 与 root-side correction；旧 planner 保留 |
 | `recipe/bace_gigpo/coordinator.py` | 新的一次性 Exact coordinator；旧 sequential coordinator 保留 |
 | `recipe/bace_gigpo/rollout_collector.py` | variant 路由、packed planned roots、correction waves、单轮 branches、artifact/metrics |

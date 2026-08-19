@@ -417,13 +417,14 @@ class ExactBatchErvCoordinator:
                 raise ValueError(
                     f"Task {task_id} exact capacity {total_capacity} is below frozen quota {quota}"
                 )
-            global_value, allocation_ties = self.engine.global_allocations(designs, quota)
-            allocation = self.engine.choose_uniform(
-                allocation_ties,
+            global_result = self.engine.global_allocation(
+                designs,
+                quota,
                 self.policy_update_id,
                 task_id,
                 "global_allocation",
             )
+            allocation = global_result.selected_allocation
             self._posterior_by_task[task_id] = posteriors_by_anchor
             selected_local_plans = {}
             branch_idx = 0
@@ -480,9 +481,21 @@ class ExactBatchErvCoordinator:
                     }
                     for anchor_id, design in designs.items()
                 },
-                "global_optimal_value": global_value,
-                "global_tie_count": len(allocation_ties),
-                "tie_optimal_global_allocations": allocation_ties,
+                "global_allocation": {
+                    "solver": global_result.solver,
+                    "num_anchors": global_result.num_anchors,
+                    "branch_quota": global_result.branch_quota,
+                    "total_information_capacity": (
+                        global_result.total_information_capacity
+                    ),
+                    "reachable_state_count": global_result.reachable_state_count,
+                    "optimal_value": global_result.optimal_value,
+                    "optimal_tie_count": global_result.optimal_count,
+                    "selected_allocation": allocation,
+                    "solver_wall_time_ms": global_result.solver_wall_time_ms,
+                },
+                "global_optimal_value": global_result.optimal_value,
+                "global_tie_count": global_result.optimal_count,
                 "selected_allocation": allocation,
                 "selected_local_plans": selected_local_plans,
                 "status": "PLANNED",
