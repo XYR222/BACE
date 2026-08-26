@@ -78,20 +78,40 @@ class AlfworldWorker:
                     pending.append(child)
 
     def _bind_game_file(self, game_file):
+        """Temporarily bind every game-pool wrapper to one concrete game.
+
+        The returned snapshots must be restored after ``env.reset()`` has
+        loaded the requested game.  Keeping the singleton iterators installed
+        would pin a persistent Ray worker to its first BACE task forever and
+        prevent subsequent natural-root resets from sampling new games.
+        """
         updated = False
+        snapshots = []
         for node in self._walk_env_nodes():
             if hasattr(node, "gamefiles"):
+                snapshots.append((node, "gamefiles", node.gamefiles))
                 node.gamefiles = [game_file]
                 if hasattr(node, "_gamefiles_iterator"):
+                    snapshots.append(
+                        (node, "_gamefiles_iterator", node._gamefiles_iterator)
+                    )
                     node._gamefiles_iterator = itertools.cycle([game_file])
                 updated = True
             if hasattr(node, "_game_files"):
+                snapshots.append((node, "_game_files", node._game_files))
                 node._game_files = [game_file]
                 if hasattr(node, "_next_game"):
+                    snapshots.append((node, "_game_iterator", node._game_iterator))
                     node._game_iterator = node._next_game()
                 updated = True
         if not updated:
             raise RuntimeError("Unable to bind ALFWorld worker to the requested game file")
+        return snapshots
+
+    @staticmethod
+    def _restore_game_pool(snapshots):
+        for node, attribute, value in reversed(snapshots):
+            setattr(node, attribute, value)
     
     def step(self, action):
         """Execute a step in the environment"""
@@ -103,9 +123,14 @@ class AlfworldWorker:
     
     def reset(self, game_file=None):
         """Reset the environment"""
+        snapshots = None
         if game_file is not None:
-            self._bind_game_file(game_file)
-        obs, infos = self.env.reset()
+            snapshots = self._bind_game_file(game_file)
+        try:
+            obs, infos = self.env.reset()
+        finally:
+            if snapshots is not None:
+                self._restore_game_pool(snapshots)
         infos['observation_text'] = obs
         return obs, infos
 

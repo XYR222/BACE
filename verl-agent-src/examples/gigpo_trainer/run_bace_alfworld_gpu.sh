@@ -84,6 +84,7 @@ max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-16384}
 max_num_seqs=${MAX_NUM_SEQS:-128}
 save_freq=${SAVE_FREQ:-30}
 test_freq=${TEST_FREQ:-10}
+val_before_train=${VAL_BEFORE_TRAIN:-false}
 resume_mode=${BACE_RESUME_MODE:-disable}
 logger_backends=${LOGGER_BACKENDS:-"['console','tensorboard']"}
 num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.1}
@@ -133,7 +134,7 @@ fi
         "${git_head}" "${ENGINE}" "${CUDA_VISIBLE_DEVICES}" "${GPU_COUNT}"
     printf 'model_path=%q\nalfworld_data=%q\ntrain_file=%q\nval_file=%q\n' \
         "${MODEL_PATH}" "${ALFWORLD_DATA}" "${TRAIN_FILE}" "${VAL_FILE}"
-    printf 'variant=batch_erv_exact topology=dynamic generation=staged batching=packed acquisition=batch_erv_exact invalid_action_mode=strict_identity\n'
+    printf 'variant=batch_erv_exact topology=dynamic generation=staged batching=packed branch_execution=selected_worker acquisition=batch_erv_exact invalid_action_mode=strict_identity\n'
     env | sort
     git status --short 2>/dev/null || true
 } > "${metadata_dir}/run_metadata.txt"
@@ -249,6 +250,7 @@ ppo_command=(python3 -m verl.trainer.main_ppo
     algorithm.bace.topology=dynamic
     algorithm.bace.dynamic_root_generation=staged
     algorithm.bace.staged_root_batching=packed
+    algorithm.bace.branch_execution_mode=selected_worker
     algorithm.bace.acquisition=batch_erv_exact
     algorithm.bace.total_leaf_budget=8
     algorithm.bace.min_natural_roots=2
@@ -331,7 +333,7 @@ ppo_command=(python3 -m verl.trainer.main_ppo
     trainer.rollout_data_dir="${rollout_data_dir}"
     trainer.test_freq="${test_freq}"
     trainer.total_epochs="${total_epochs}"
-    trainer.val_before_train=false
+    trainer.val_before_train="${val_before_train}"
     trainer.resume_mode="${resume_mode}"
     "${hydra_overrides[@]}")
 

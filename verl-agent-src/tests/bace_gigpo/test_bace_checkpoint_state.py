@@ -110,7 +110,7 @@ def test_dynamic_bace_resume_rejects_missing_or_mismatched_state(tmp_path):
         make_trainer(tmp_path)._load_checkpoint()
 
 
-def bare_collector(threshold=0.005):
+def bare_collector(threshold=0.005, tie_break_identity_mode="legacy_uuid"):
     collector = object.__new__(BaceTrajectoryCollector)
     collector.variant = "batch_erv_exact"
     collector.topology = "dynamic"
@@ -125,6 +125,9 @@ def bare_collector(threshold=0.005):
         max_strength=8.0,
     )
     collector.parameter_signature = {"batch_erv_threshold": threshold}
+    collector.tie_break_identity_mode = tie_break_identity_mode
+    if tie_break_identity_mode != "legacy_uuid":
+        collector.parameter_signature["tie_break_identity_mode"] = tie_break_identity_mode
     return collector
 
 
@@ -142,3 +145,17 @@ def test_collector_state_round_trip_and_parameter_signature_rejection():
     incompatible = bare_collector(threshold=0.01)
     with pytest.raises(ValueError, match="parameter signature"):
         incompatible.load_state_dict(payload)
+
+
+def test_collector_checkpoint_rejects_tie_break_identity_mode_change():
+    legacy_payload = json.loads(json.dumps(bare_collector().state_dict()))
+    stable_payload = json.loads(json.dumps(
+        bare_collector(tie_break_identity_mode="stable_v1").state_dict()
+    ))
+
+    with pytest.raises(ValueError, match="parameter signature"):
+        bare_collector(tie_break_identity_mode="stable_v1").load_state_dict(
+            legacy_payload
+        )
+    with pytest.raises(ValueError, match="parameter signature"):
+        bare_collector().load_state_dict(stable_payload)

@@ -259,6 +259,7 @@ algorithm:
     topology: fixed  # fixed | dynamic
     dynamic_root_generation: preallocated  # preallocated | staged
     staged_root_batching: sequential  # sequential | packed | frontier; frontier enables task-local mixed MODEL_READY scheduling
+    branch_execution_mode: legacy_dense  # legacy_dense preserves the old executor; selected_worker compacts active Exact branches
     frontier_batch_coalescing:
       enabled: False  # merge only already MODEL_READY jobs; never preallocate extra roots
       max_batch_size: 0  # 0 means dispatch all ready jobs
@@ -288,6 +289,7 @@ algorithm:
     local_prior_strength: 2.0
     local_credit_mode: occurrence  # occurrence | action_mean
     invalid_action_mode: strict_identity  # strict_identity | valid_only_branch | single_invalid_bucket
+    tie_break_identity_mode: legacy_uuid  # legacy_uuid preserves active runs; stable_v1 is deterministic across UUID changes
     artifacts:
       enabled: True
       directory: null  # defaults to rollout_data_dir/bace_trace or default_local_dir/bace_trace

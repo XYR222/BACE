@@ -21,6 +21,25 @@ def won(item):
     return replace(item, terminal_reward=1.0, won=True)
 
 
+def relabel_uuid_lineage(roots, task_id, prefix):
+    """Change UUID-like lineage only while preserving all decision content."""
+    relabeled = []
+    for root_index, item in enumerate(roots):
+        root_id = f"{prefix}-root-{root_index}"
+        events = tuple(
+            replace(event, occurrence_id=f"{root_id}:{event.step_index}")
+            for event in item.events
+        )
+        relabeled.append(replace(
+            item,
+            task_id=task_id,
+            episode_group_id=task_id,
+            root_id=root_id,
+            events=events,
+        ))
+    return relabeled
+
+
 def engine(threshold=0.0, seed=17):
     return ExactBatchErvEngine(
         max_branches_per_anchor=2,
@@ -280,6 +299,74 @@ def test_exact_coordinator_emits_all_branches_in_one_frozen_batch():
     assert diagnostic["global_allocation"]["solver"] == "quota_aware_exact_dp"
     assert diagnostic["global_allocation"]["branch_quota"] == 2
     assert "tie_optimal_global_allocations" not in diagnostic
+
+
+def test_stable_tie_break_is_invariant_to_uuid_lineage():
+    source = [root("r1", "open fridge"), root("r2", "go to table")]
+    first_roots = relabel_uuid_lineage(source, "uuid-run-a", "a")
+    second_roots = relabel_uuid_lineage(source, "uuid-run-b", "b")
+
+    def run(items):
+        task_id = items[0].task_id
+        coordinator = ExactBatchErvCoordinator(
+            max_branches_per_anchor=2,
+            prior_strength=2.0,
+            threshold=0.0,
+            seed=11,
+            tie_break_identity_mode="stable_v1",
+        )
+        coordinator.set_policy_update_id(7)
+        coordinator.initialize(
+            items,
+            branch_quota_by_task={task_id: 1},
+            prior_mean_by_task={task_id: 0.5},
+        )
+        requests = coordinator.build_round_requests()
+        diagnostic = coordinator.last_round_diagnostics[0]
+        semantic_requests = [
+            (
+                request.target_turn,
+                request.selected_canonical_action,
+                request.parsed_action_prefix,
+                request.expected_observation,
+                request.copied_response_token_ids,
+            )
+            for request in requests
+        ]
+        return diagnostic, semantic_requests
+
+    first_diagnostic, first_requests = run(first_roots)
+    second_diagnostic, second_requests = run(second_roots)
+
+    assert first_diagnostic["decision_task_key"] == second_diagnostic["decision_task_key"]
+    assert first_diagnostic["selected_allocation"] == second_diagnostic["selected_allocation"]
+    assert first_diagnostic["selected_local_plans"] == second_diagnostic["selected_local_plans"]
+    assert first_requests == second_requests
+    assert first_diagnostic["tie_break_identity_mode"] == "stable_v1"
+
+
+def test_stable_tie_break_uses_policy_step_to_sample_equal_local_plans():
+    roots = [root("r1", "open fridge"), root("r2", "go to table")]
+    selected_actions = set()
+    for policy_update_id in range(32):
+        coordinator = ExactBatchErvCoordinator(
+            max_branches_per_anchor=2,
+            prior_strength=2.0,
+            threshold=0.0,
+            seed=11,
+            tie_break_identity_mode="stable_v1",
+        )
+        coordinator.set_policy_update_id(policy_update_id)
+        coordinator.initialize(
+            roots,
+            branch_quota_by_task={"task-1": 1},
+            prior_mean_by_task={"task-1": 0.5},
+        )
+        selected_actions.add(
+            coordinator.build_round_requests()[0].selected_canonical_action
+        )
+
+    assert selected_actions == {"go to table", "open fridge"}
 
 
 def test_exact_strict_identity_support_includes_valid_and_invalid_natural_edges():

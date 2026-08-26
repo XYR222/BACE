@@ -279,6 +279,7 @@ class ExactBatchTopologyPlanner:
         tie_rel_tolerance: float,
         seed: int = 0,
         invalid_action_mode: str = "strict_identity",
+        tie_break_identity_mode: str = "legacy_uuid",
     ):
         if not 1 <= min_natural_roots <= total_budget:
             raise ValueError("min_natural_roots must be in [1, total_budget]")
@@ -288,6 +289,11 @@ class ExactBatchTopologyPlanner:
         self.competence_threshold = float(competence_threshold)
         self.local_prior_strength = float(local_prior_strength)
         self.invalid_action_mode = invalid_action_mode
+        if tie_break_identity_mode not in AnchorIndex.IDENTITY_MODES:
+            raise ValueError(
+                "tie_break_identity_mode must be legacy_uuid or stable_v1"
+            )
+        self.tie_break_identity_mode = tie_break_identity_mode
         self.engine = ExactBatchErvEngine(
             max_branches_per_anchor=max_branches_per_anchor,
             threshold=batch_erv_threshold,
@@ -331,7 +337,11 @@ class ExactBatchTopologyPlanner:
             alpha=state.family_posterior.alpha + successes,
             beta=state.family_posterior.beta + len(roots) - successes,
         )
-        index = AnchorIndex(roots, invalid_action_mode=self.invalid_action_mode)
+        index = AnchorIndex(
+            roots,
+            invalid_action_mode=self.invalid_action_mode,
+            tie_break_identity_mode=self.tie_break_identity_mode,
+        )
         designs = {}
         for anchor in index.anchors_for_task(state.task_id):
             posteriors = {}

@@ -305,9 +305,15 @@ class ExactBatchErvCoordinator:
         tie_rel_tolerance: float = 1e-10,
         seed: int = 0,
         invalid_action_mode: str = "strict_identity",
+        tie_break_identity_mode: str = "legacy_uuid",
     ):
         self.prior_strength = float(prior_strength)
         self.invalid_action_mode = invalid_action_mode
+        if tie_break_identity_mode not in AnchorIndex.IDENTITY_MODES:
+            raise ValueError(
+                "tie_break_identity_mode must be legacy_uuid or stable_v1"
+            )
+        self.tie_break_identity_mode = tie_break_identity_mode
         self.engine = ExactBatchErvEngine(
             max_branches_per_anchor=max_branches_per_anchor,
             threshold=threshold,
@@ -379,7 +385,11 @@ class ExactBatchErvCoordinator:
         roots_by_task = {}
         for root in roots:
             roots_by_task.setdefault(root.task_id, []).append(root)
-        self.index = AnchorIndex(roots, invalid_action_mode=self.invalid_action_mode)
+        self.index = AnchorIndex(
+            roots,
+            invalid_action_mode=self.invalid_action_mode,
+            tie_break_identity_mode=self.tie_break_identity_mode,
+        )
         anchors_by_id = self.index._anchors
         self._pending_requests = []
         self._selection_by_request = {}
@@ -388,11 +398,14 @@ class ExactBatchErvCoordinator:
         self.last_round_diagnostics = []
         skipped = {}
 
-        for task_id in sorted(roots_by_task):
+        for task_id in self.index.ordered_task_ids():
+            decision_task_key = self.index.decision_key_for_task(task_id)
             quota = int(branch_quota_by_task[task_id])
             if quota == 0:
                 self.last_round_diagnostics.append({
                     "task_id": task_id,
+                    "tie_break_identity_mode": self.tie_break_identity_mode,
+                    "decision_task_key": decision_task_key,
                     "branch_quota": 0,
                     "global_optimal_value": 0.0,
                     "selected_allocation": {},
@@ -421,7 +434,7 @@ class ExactBatchErvCoordinator:
                 designs,
                 quota,
                 self.policy_update_id,
-                task_id,
+                decision_task_key,
                 "global_allocation",
             )
             allocation = global_result.selected_allocation
@@ -436,7 +449,7 @@ class ExactBatchErvCoordinator:
                 local_plan = self.engine.choose_uniform(
                     local_ties,
                     self.policy_update_id,
-                    task_id,
+                    decision_task_key,
                     anchor_id,
                     "local_plan",
                     size,
@@ -449,11 +462,13 @@ class ExactBatchErvCoordinator:
                 }
                 anchor = anchors_by_id[anchor_id]
                 for local_index, action in enumerate(local_plan.actions):
-                    origins = anchor.origins_by_action[action]
+                    origins = self.index.ordered_origins(
+                        anchor.origins_by_action[action]
+                    )
                     origin = self.engine.choose_uniform(
                         origins,
                         self.policy_update_id,
-                        task_id,
+                        decision_task_key,
                         anchor_id,
                         action,
                         "origin",
@@ -471,6 +486,8 @@ class ExactBatchErvCoordinator:
                 )
             self.last_round_diagnostics.append({
                 "task_id": task_id,
+                "tie_break_identity_mode": self.tie_break_identity_mode,
+                "decision_task_key": decision_task_key,
                 "branch_quota": quota,
                 "current_instance_prior_mean": prior_mean_by_task[task_id],
                 "information_capacity": total_capacity,

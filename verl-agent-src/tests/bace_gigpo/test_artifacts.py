@@ -160,6 +160,39 @@ def test_trace_validator_rejects_wrong_global_allocation_quota(tmp_path):
     assert any("uses 1 branches, expected 2" in error for error in result["errors"])
 
 
+def test_trace_validator_checks_selected_worker_cost_conservation(tmp_path):
+    step_dir = build_valid_trace(tmp_path)
+    manifest_path = step_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["branch_execution_mode"] = "selected_worker"
+    manifest_path.write_text(json.dumps(manifest))
+
+    summary_path = step_dir / "summary.json"
+    summary = json.loads(summary_path.read_text())
+    summary["bace_metrics"] = {
+        "requested": 1,
+        "branch_execution_restore_replay_steps": 0,
+        "branch_suffix_active_sequences": 2,
+        "branch_suffix_dense_equivalent_sequences": 3,
+        "branch_suffix_inactive_sequences_avoided": 1,
+        "branch_suffix_environment_steps": 2,
+    }
+    summary["diagnostics"].update({
+        "branch_total_mechanical_replay_steps": 4,
+        "branch_origin_transition_steps": 1,
+        "branch_total_environment_steps": 5,
+        "replay_environment_steps": 5,
+    })
+    summary_path.write_text(json.dumps(summary))
+    assert validate_step(step_dir)["ok"]
+
+    summary["bace_metrics"]["branch_suffix_inactive_sequences_avoided"] = 2
+    summary_path.write_text(json.dumps(summary))
+    result = validate_step(step_dir)
+    assert not result["ok"]
+    assert any("does not conserve sequences" in error for error in result["errors"])
+
+
 def test_training_diagnostics_tolerates_missing_optional_advantages(tmp_path):
     collector = object.__new__(BaceTrajectoryCollector)
     collector.artifact_store = BaceArtifactStore(tmp_path, 0, {})
@@ -207,3 +240,43 @@ def test_trace_validator_accepts_occurrence_level_gigpo_macro_values(tmp_path):
 
     result = validate_step(store.step_dir)
     assert result["ok"], result["errors"]
+
+
+def test_trace_validator_uses_float32_semantics_for_advantage_components(tmp_path):
+    store = BaceArtifactStore(tmp_path, 5, {
+        "advantage_semantics": "gigpo_macro",
+        "gigpo_step_advantage_w": 1.0,
+    })
+    store.append("roots", {"root_id": "root-1"})
+    store.append("leaves", {
+        "root_id": "root-1",
+        "occurrence_id": "root-1:0",
+        "action_format_valid": True,
+        "action_environment_valid": True,
+        "action_identity": "valid::look",
+    })
+    store.append("topology", {"root_ids": ["root-1"], "plan": {"tasks": {}}})
+    macro = np.float32(-20.02103042602539)
+    local = np.float32(-13.599809646606445)
+    combined = np.float32(macro + local)
+    store.append("trainable_occurrences", {
+        "source_type": "root",
+        "occurrence_id": "root-1:0",
+        "traj_uid": "root-1",
+        "leaf_id": "root-1",
+        "macro_advantage": float(macro),
+        "local_advantage": float(local),
+        "occurrence_advantage": float(combined),
+    })
+    store.finalize({"status": "complete"})
+
+    result = validate_step(store.step_dir)
+    assert result["ok"], result["errors"]
+
+    stream = store.step_dir / "trainable_occurrences.jsonl"
+    record = json.loads(stream.read_text())
+    record["occurrence_advantage"] += 1e-3
+    stream.write_text(json.dumps(record) + "\n")
+    result = validate_step(store.step_dir)
+    assert not result["ok"]
+    assert any("inconsistent advantage components" in error for error in result["errors"])

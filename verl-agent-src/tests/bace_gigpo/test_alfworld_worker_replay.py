@@ -6,7 +6,7 @@ from agent_system.environments.env_package.alfworld.envs import AlfworldEnvs, Al
 
 class FakeBatchEnv:
     def __init__(self):
-        self.gamefiles = ["old-game"]
+        self.gamefiles = ["old-game-1", "old-game-2"]
         self._gamefiles_iterator = iter(self.gamefiles)
 
 
@@ -20,9 +20,11 @@ class FakeEnv:
 
     def reset(self):
         self.turn = 0
+        game_file = next(self.batch_env._gamefiles_iterator)
         return ["turn-0"], {
             "admissible_commands": [["a", "stop"]],
             "won": [False],
+            "extra.gamefile": [game_file],
         }
 
     def step(self, actions):
@@ -45,8 +47,20 @@ def test_worker_binds_game_and_replays_prefix():
     obs, info, done = worker.replay("new-game", ["a", "a"])
     assert obs == ["turn-2"]
     assert not done
-    assert worker.env.batch_env.gamefiles == ["new-game"]
+    assert worker.env.batch_env.gamefiles == ["old-game-1", "old-game-2"]
     assert info["admissible_commands"] == [["a", "stop"]]
+
+
+def test_worker_temporary_binding_preserves_natural_game_sequence():
+    worker = AlfworldWorker(config={}, seed=7, base_env=FakeBaseEnv())
+
+    _, bound_info = worker.reset(game_file="branch-game")
+    _, first_natural_info = worker.reset()
+    _, second_natural_info = worker.reset()
+
+    assert bound_info["extra.gamefile"] == ["branch-game"]
+    assert first_natural_info["extra.gamefile"] == ["old-game-1"]
+    assert second_natural_info["extra.gamefile"] == ["old-game-2"]
 
 
 def test_worker_rejects_early_terminal():

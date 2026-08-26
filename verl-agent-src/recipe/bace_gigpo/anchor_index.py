@@ -11,17 +11,101 @@ from .types import AnchorRecord, OriginOccurrence, RootEvent, RootEventLog
 class AnchorIndex:
     """Exact-observation anchor index built only from frozen natural roots."""
 
-    def __init__(self, roots: list[RootEventLog], invalid_action_mode: str = "strict_identity"):
+    IDENTITY_MODES = {"legacy_uuid", "stable_v1"}
+
+    def __init__(
+        self,
+        roots: list[RootEventLog],
+        invalid_action_mode: str = "strict_identity",
+        tie_break_identity_mode: str = "legacy_uuid",
+    ):
         if invalid_action_mode not in {"strict_identity", "valid_only_branch", "single_invalid_bucket"}:
             raise ValueError(f"Unknown invalid action mode: {invalid_action_mode}")
+        if tie_break_identity_mode not in self.IDENTITY_MODES:
+            raise ValueError(
+                "tie_break_identity_mode must be legacy_uuid or stable_v1"
+            )
         self.invalid_action_mode = invalid_action_mode
+        self.tie_break_identity_mode = tie_break_identity_mode
         self.roots = {root.root_id: root for root in roots}
         self.events = {
             event.occurrence_id: event
             for root in roots
             for event in root.events
         }
+        self._decision_key_by_task = self._build_task_decision_keys(roots)
+        self._root_decision_key_by_id = (
+            {root.root_id: self._root_decision_key(root) for root in roots}
+            if self.tie_break_identity_mode == "stable_v1"
+            else {}
+        )
         self._anchors = self._build(roots)
+
+    def _build_task_decision_keys(self, roots: list[RootEventLog]) -> dict[str, str]:
+        if self.tie_break_identity_mode == "legacy_uuid":
+            return {root.task_id: root.task_id for root in roots}
+        grouped: dict[str, set[tuple[int, str]]] = defaultdict(set)
+        for root in roots:
+            grouped[root.task_id].add(
+                (int(root.task_batch_index), str(root.environment_reset_key))
+            )
+        result = {}
+        for task_id, identities in grouped.items():
+            if len(identities) != 1:
+                raise ValueError(
+                    f"Task {task_id} maps to multiple stable identities: "
+                    f"{sorted(identities)!r}"
+                )
+            task_batch_index, reset_key = next(iter(identities))
+            payload = repr(("stable_v1", task_batch_index, reset_key)).encode("utf-8")
+            result[task_id] = hashlib.sha256(payload).hexdigest()
+        return result
+
+    @staticmethod
+    def _root_decision_key(root: RootEventLog) -> str:
+        """Content identity for stable origin ordering; excludes UUID lineage."""
+        events = tuple(
+            (
+                int(event.step_index),
+                to_hashable(event.pre_action_observation),
+                event.action_identity or event.canonical_action,
+                tuple(event.response_token_ids),
+                to_hashable(event.post_action_observation),
+                float(event.reward),
+                bool(event.done),
+            )
+            for event in root.events
+        )
+        payload = repr((
+            "stable_origin_v1",
+            int(root.task_batch_index),
+            str(root.environment_reset_key),
+            events,
+            float(root.terminal_reward),
+            bool(root.won),
+        )).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def decision_key_for_task(self, task_id: str) -> str:
+        return self._decision_key_by_task[task_id]
+
+    def ordered_task_ids(self) -> list[str]:
+        return sorted(
+            self._decision_key_by_task,
+            key=lambda task_id: (self._decision_key_by_task[task_id], task_id),
+        )
+
+    def ordered_origins(self, origins: list[OriginOccurrence]) -> list[OriginOccurrence]:
+        if self.tie_break_identity_mode == "legacy_uuid":
+            return list(origins)
+        return sorted(
+            origins,
+            key=lambda origin: (
+                self._root_decision_key_by_id[origin.root_id],
+                int(origin.step_index),
+                str(origin.action_id),
+            ),
+        )
 
     def _statistical_action_id(self, event: RootEvent) -> str | None:
         if not event.action_format_valid:
@@ -37,8 +121,8 @@ class AnchorIndex:
         return identity
 
     @staticmethod
-    def _anchor_id(task_id: str, anchor_key) -> str:
-        payload = repr((task_id, to_hashable(anchor_key))).encode("utf-8")
+    def _anchor_id(identity_key: str, anchor_key) -> str:
+        payload = repr((identity_key, to_hashable(anchor_key))).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()[:20]
 
     def _build(self, roots: list[RootEventLog]) -> dict[str, AnchorRecord]:
@@ -56,7 +140,9 @@ class AnchorIndex:
             actions = sorted({self._statistical_action_id(event) for _, event in occurrences})
             if len(occurrences) < 2 or len(actions) < 2:
                 continue
-            anchor_id = self._anchor_id(task_id, anchor_key)
+            anchor_id = self._anchor_id(
+                self._decision_key_by_task[task_id], anchor_key
+            )
             record = AnchorRecord(
                 task_id=task_id,
                 anchor_id=anchor_id,

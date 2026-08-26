@@ -43,9 +43,20 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         self.staged_root_batching = str(
             bace_config.get("staged_root_batching", "sequential")
         )
+        self.branch_execution_mode = str(
+            bace_config.get("branch_execution_mode", "legacy_dense")
+        )
         self.invalid_action_mode = str(
             bace_config.get("invalid_action_mode", "strict_identity")
         )
+        self.tie_break_identity_mode = str(
+            bace_config.get("tie_break_identity_mode", "legacy_uuid")
+        )
+        if self.tie_break_identity_mode not in AnchorIndex.IDENTITY_MODES:
+            raise ValueError(
+                "algorithm.bace.tie_break_identity_mode must be "
+                "legacy_uuid or stable_v1"
+            )
         if self.dynamic_root_generation not in {"preallocated", "staged"}:
             raise ValueError(
                 "algorithm.bace.dynamic_root_generation must be preallocated or staged"
@@ -54,6 +65,22 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             raise ValueError(
                 "algorithm.bace.staged_root_batching must be sequential, packed, or frontier"
             )
+        if self.branch_execution_mode not in {"legacy_dense", "selected_worker"}:
+            raise ValueError(
+                "algorithm.bace.branch_execution_mode must be legacy_dense or selected_worker"
+            )
+        if self.branch_execution_mode == "selected_worker":
+            required = (
+                "get_observations_selected",
+                "replay_selected",
+                "step_selected",
+            )
+            missing = [name for name in required if not callable(getattr(branch_envs, name, None))]
+            if missing:
+                raise ValueError(
+                    "selected_worker branch execution requires environment methods: "
+                    + ", ".join(missing)
+                )
         if self.staged_root_batching == "frontier" and (
             self.topology != "dynamic" or self.dynamic_root_generation != "staged"
         ):
@@ -118,6 +145,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                     tie_rel_tolerance=float(bace_config.batch_erv_tie_rel_tolerance),
                     seed=int(config.env.seed),
                     invalid_action_mode=self.invalid_action_mode,
+                    tie_break_identity_mode=self.tie_break_identity_mode,
                 )
             else:
                 self.topology_planner = DynamicTopologyPlanner(
@@ -163,6 +191,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 tie_rel_tolerance=float(bace_config.batch_erv_tie_rel_tolerance),
                 seed=int(config.env.seed),
                 invalid_action_mode=self.invalid_action_mode,
+                tie_break_identity_mode=self.tie_break_identity_mode,
             )
         else:
             raise ValueError(f"Unknown BACE acquisition mode: {self.acquisition}")
@@ -185,6 +214,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             "acquisition": self.acquisition,
             "dynamic_root_generation": self.dynamic_root_generation,
             "staged_root_batching": self.staged_root_batching,
+            "branch_execution_mode": self.branch_execution_mode,
             "invalid_action_mode": self.invalid_action_mode,
             "local_credit_mode": str(bace_config.local_credit_mode),
             "total_leaf_budget": int(bace_config.total_leaf_budget),
@@ -206,6 +236,13 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             "replay_compare_action_set": bool(bace_config.replay.compare_action_set),
             "replay_max_origin_retries": self.max_origin_retries,
         }
+        # Preserve byte-for-byte compatibility with checkpoints written before
+        # stable_v1 existed.  Stable runs add the field, so cross-mode resume is
+        # rejected by the existing strict signature comparison.
+        if self.tie_break_identity_mode != "legacy_uuid":
+            self.parameter_signature["tie_break_identity_mode"] = (
+                self.tie_break_identity_mode
+            )
 
     def set_step(self, step):
         self.current_step = int(step)
@@ -278,12 +315,14 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             "acquisition": self.acquisition,
             "dynamic_root_generation": self.dynamic_root_generation,
             "staged_root_batching": self.staged_root_batching,
+            "branch_execution_mode": self.branch_execution_mode,
             "frontier_batch_coalescing": {
                 "enabled": bool(self.config.algorithm.bace.get("frontier_batch_coalescing", {}).get("enabled", False)),
                 "max_batch_size": int(self.config.algorithm.bace.get("frontier_batch_coalescing", {}).get("max_batch_size", 0)),
                 "min_batch_size": int(self.config.algorithm.bace.get("frontier_batch_coalescing", {}).get("min_batch_size", 1)),
             },
             "invalid_action_mode": self.invalid_action_mode,
+            "tie_break_identity_mode": self.tie_break_identity_mode,
             "local_credit_mode": str(self.config.algorithm.bace.local_credit_mode),
             "advantage_semantics": "gigpo_macro",
             "gigpo_mode": str(self.config.algorithm.gigpo.mode),
@@ -356,6 +395,9 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         index = AnchorIndex(
             root_logs,
             invalid_action_mode=getattr(self, "invalid_action_mode", "strict_identity"),
+            tie_break_identity_mode=getattr(
+                self, "tie_break_identity_mode", "legacy_uuid"
+            ),
         )
         candidate_action_counts = []
         invalid_fragmentation = {}
@@ -377,22 +419,92 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             "root_ids": [root.root_id for root in root_logs],
         })
 
-    def _trace_replay_results(self, requests, results, phase, elapsed, prefix_lengths=None):
-        if self.artifact_store is None:
-            return
+    def _record_branch_execution_cost(self, kind, steps, elapsed, jobs):
+        """Record physical branch work, including operations with no validator result."""
+        metric_names = {
+            "validation_replay": (
+                "branch_validation_replay_steps",
+                "branch_validation_replay_seconds",
+                "branch_validation_replay_jobs",
+            ),
+            "retry_replay": (
+                "branch_retry_replay_steps",
+                "branch_retry_replay_seconds",
+                "branch_retry_replay_jobs",
+            ),
+            "execution_restore_replay": (
+                "branch_execution_restore_replay_steps",
+                "branch_execution_restore_replay_seconds",
+                "branch_execution_restore_replay_jobs",
+            ),
+            "origin_transition": (
+                "branch_origin_transition_steps",
+                "branch_origin_transition_seconds",
+                "branch_origin_transition_jobs",
+            ),
+        }
+        if kind not in metric_names:
+            raise ValueError(f"Unknown branch execution cost kind: {kind}")
+        step_key, seconds_key, jobs_key = metric_names[kind]
+        steps = int(steps)
+        jobs = int(jobs)
+        elapsed = float(elapsed)
+        for target in (self.trace_diagnostics, self.orchestration_metrics):
+            target[step_key] = target.get(step_key, 0) + steps
+            target[seconds_key] = target.get(seconds_key, 0.0) + elapsed
+            target[jobs_key] = target.get(jobs_key, 0) + jobs
+            target["branch_total_environment_steps"] = (
+                target.get("branch_total_environment_steps", 0) + steps
+            )
+            target["branch_total_environment_seconds"] = (
+                target.get("branch_total_environment_seconds", 0.0) + elapsed
+            )
+            if kind != "origin_transition":
+                target["branch_total_mechanical_replay_steps"] = (
+                    target.get("branch_total_mechanical_replay_steps", 0) + steps
+                )
+                target["branch_total_mechanical_replay_seconds"] = (
+                    target.get("branch_total_mechanical_replay_seconds", 0.0) + elapsed
+                )
+        # Backward-compatible diagnostic, now counting every physical branch
+        # environment action rather than omitting execution restores.
+        self.trace_diagnostics["replay_environment_steps"] = self.trace_diagnostics[
+            "branch_total_environment_steps"
+        ]
+        if self.artifact_store is not None:
+            self.artifact_store.append("branch_execution_costs", {
+                "kind": kind,
+                "jobs": jobs,
+                "environment_steps": steps,
+                "elapsed_seconds": elapsed,
+            })
+
+    def _trace_replay_results(
+        self,
+        requests,
+        results,
+        phase,
+        elapsed,
+        prefix_lengths=None,
+        cost_kind="validation_replay",
+    ):
         prefix_lengths = prefix_lengths or [len(request.parsed_action_prefix) for request in requests]
         categories = self.trace_diagnostics.setdefault("replay_category_counts", {})
         timings = self.trace_diagnostics.setdefault("phase_timing_seconds", {})
         timings[phase] = timings.get(phase, 0.0) + float(elapsed)
-        self.trace_diagnostics["replay_environment_steps"] = (
-            self.trace_diagnostics.get("replay_environment_steps", 0) + sum(prefix_lengths)
+        self._record_branch_execution_cost(
+            cost_kind,
+            steps=sum(prefix_lengths),
+            elapsed=elapsed,
+            jobs=len(requests),
         )
         for request, result, prefix_length in zip(requests, results, prefix_lengths):
             categories[result.category] = categories.get(result.category, 0) + 1
-            payload = {"phase": phase, "elapsed_seconds": elapsed, "prefix_length": prefix_length,
-                       "request": request, "result": result,
-                       **self.replay_retry_metadata.get(request.request_id, {})}
-            self.artifact_store.append("replay_attempts", payload)
+            if self.artifact_store is not None:
+                payload = {"phase": phase, "elapsed_seconds": elapsed, "prefix_length": prefix_length,
+                           "cost_kind": cost_kind, "request": request, "result": result,
+                           **self.replay_retry_metadata.get(request.request_id, {})}
+                self.artifact_store.append("replay_attempts", payload)
 
     def _trace_branch_selections(self, requests):
         if not requests:
@@ -409,12 +521,16 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         index = AnchorIndex(
             root_logs,
             invalid_action_mode=getattr(self, "invalid_action_mode", "strict_identity"),
+            tie_break_identity_mode=getattr(
+                self, "tie_break_identity_mode", "legacy_uuid"
+            ),
         )
         candidates = []
         for anchor in index.anchors_for_task(request.task_id):
             if repr(anchor.anchor_key) != repr(request.expected_anchor_key):
                 continue
             candidates.extend(anchor.origins_by_action.get(request.selected_canonical_action, []))
+        candidates = index.ordered_origins(candidates)
         origin = next((item for item in candidates if item.occurrence_id not in used_occurrences), None)
         if origin is None:
             return None
@@ -1116,7 +1232,8 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             self.topology_planner.update_history(topology_plan)
         return output, root_logs, topology_plan
 
-    def _collect_suffixes(self, gen_batch, actor_rollout_wg, requests, initial_obs, origin_rewards, origin_dones):
+    def _collect_suffixes_legacy(self, gen_batch, actor_rollout_wg, requests, initial_obs, origin_rewards, origin_dones):
+        """Original dense suffix executor retained for compatibility and A/B checks."""
         batch_size = len(requests)
         is_done = np.asarray(origin_dones, dtype=bool).copy()
         episode_rewards = np.asarray(origin_rewards, dtype=np.float32).copy()
@@ -1228,7 +1345,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             for start in range(0, len(requests), capacity)
         ]
 
-    def _execute_chunk(
+    def _execute_chunk_legacy(
         self,
         root_output,
         gen_batch,
@@ -1260,7 +1377,13 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         for attempt in range(self.max_origin_retries + 1):
             started = time.monotonic()
             replay_results = self.replay_adapter.replay_and_validate(active_requests)
-            self._trace_replay_results(active_requests, replay_results, f"initial_validation_{attempt}", time.monotonic() - started)
+            self._trace_replay_results(
+                active_requests,
+                replay_results,
+                f"initial_validation_{attempt}",
+                time.monotonic() - started,
+                cost_kind="validation_replay" if attempt == 0 else "retry_replay",
+            )
             all_results.extend(zip(active_requests, replay_results))
             failed = []
             retry_requests = []
@@ -1319,7 +1442,15 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             return [], None, None, None
 
         def execute_origins(origin_requests, phase):
+            restore_started = time.monotonic()
             self.branch_envs.replay(origin_requests)
+            restore_elapsed = time.monotonic() - restore_started
+            self._record_branch_execution_cost(
+                "execution_restore_replay",
+                steps=sum(len(request.parsed_action_prefix) for request in origin_requests),
+                elapsed=restore_elapsed,
+                jobs=len(origin_requests),
+            )
             started = time.monotonic()
             observations, rewards, dones, origin_infos = self.branch_envs.step(
                 [request.copied_raw_model_response for request in origin_requests]
@@ -1330,6 +1461,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             self._trace_replay_results(
                 origin_requests, results, phase, time.monotonic() - started,
                 prefix_lengths=[1] * len(origin_requests),
+                cost_kind="origin_transition",
             )
             return observations, np.asarray(rewards), np.asarray(dones), origin_infos, results
 
@@ -1367,7 +1499,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
 
         branch_gen_batch = gen_batch.select_idxs([request.task_batch_index for request in valid_requests])
         suffix_started = time.monotonic()
-        suffix_output, terminal_rewards, terminal_dones = self._collect_suffixes(
+        suffix_output, terminal_rewards, terminal_dones = self._collect_suffixes_legacy(
             branch_gen_batch,
             actor_rollout_wg,
             valid_requests,
@@ -1414,6 +1546,458 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 suffix_output.non_tensor_batch["traj_uid"],
             )
         return valid_requests, origin_output, suffix_output, terminal_rewards
+
+    def _collect_suffixes_selected(
+        self,
+        gen_batch,
+        actor_rollout_wg,
+        requests,
+        worker_slots,
+        origin_rewards,
+        origin_dones,
+    ):
+        """Roll out only active persistent slots while preserving branch-major rows."""
+        batch_size = len(requests)
+        is_done = np.asarray(origin_dones, dtype=bool).reshape(-1).copy()
+        episode_rewards = np.asarray(origin_rewards, dtype=np.float32).reshape(-1).copy()
+        episode_lengths = np.ones(batch_size, dtype=np.float32)
+        tool_callings = np.zeros(batch_size, dtype=np.float32)
+        total_batch_list = [[] for _ in range(batch_size)]
+        max_horizon = max((request.remaining_horizon for request in requests), default=0)
+
+        for suffix_step in range(max_horizon):
+            active_indices = [
+                index
+                for index, request in enumerate(requests)
+                if not is_done[index] and suffix_step < request.remaining_horizon
+            ]
+            if not active_indices:
+                break
+            active_requests = [requests[index] for index in active_indices]
+            active_slots = [worker_slots[index] for index in active_indices]
+            observations = self.branch_envs.get_observations_selected(active_slots)
+            active_gen_batch = gen_batch.select_idxs(active_indices)
+
+            started = time.monotonic()
+            batch = self.preprocess_batch(gen_batch=active_gen_batch, obs=observations)
+            batch.non_tensor_batch["step_index"] = np.asarray(
+                [request.target_turn + 1 + suffix_step for request in active_requests],
+                dtype=np.int32,
+            )
+            batch.non_tensor_batch["admissible_actions"] = np.asarray(
+                observations["admissible_actions"], dtype=object
+            )
+            batch_keys = ["input_ids", "attention_mask", "position_ids"]
+            non_tensor_keys = ["raw_prompt_ids"]
+            for key in ("multi_modal_data", "raw_prompt", "tools_kwargs"):
+                if key in batch.non_tensor_batch:
+                    non_tensor_keys.append(key)
+            batch_input = batch.pop(
+                batch_keys=batch_keys,
+                non_tensor_batch_keys=non_tensor_keys,
+            )
+            batch_input.meta_info = active_gen_batch.meta_info
+            padded, pad_size = pad_dataproto_to_divisor(
+                batch_input, actor_rollout_wg.world_size
+            )
+            submitted_size = len(padded)
+            output = unpad_dataproto(
+                actor_rollout_wg.generate_sequences(padded), pad_size=pad_size
+            )
+
+            batch.non_tensor_batch["uid"] = np.asarray(
+                [request.task_id for request in active_requests], dtype=object
+            )
+            batch.non_tensor_batch["traj_uid"] = np.asarray(
+                [request.branch_id for request in active_requests], dtype=object
+            )
+            batch.non_tensor_batch["occurrence_id"] = np.asarray(
+                [
+                    f"{request.branch_id}:suffix:{suffix_step}"
+                    for request in active_requests
+                ],
+                dtype=object,
+            )
+            batch.non_tensor_batch["task_batch_index"] = np.asarray(
+                [request.task_batch_index for request in active_requests], dtype=np.int32
+            )
+            batch = batch.union(output)
+            text_actions = self.tokenizer.batch_decode(
+                batch.batch["responses"], skip_special_tokens=True
+            )
+            next_obs, rewards, dones, infos = self.branch_envs.step_selected(
+                active_slots, text_actions
+            )
+            rewards = np.asarray(rewards).reshape(-1)
+            dones = np.asarray(dones).reshape(-1)
+
+            batch.non_tensor_batch["is_action_valid"] = np.asarray(
+                [info.get("is_action_valid", True) for info in infos], dtype=bool
+            )
+            batch.non_tensor_batch["raw_model_response"] = np.asarray(
+                text_actions, dtype=object
+            )
+            batch.non_tensor_batch["projected_action"] = np.asarray(
+                [info.get("projected_action", "INVALID") for info in infos], dtype=object
+            )
+            batch.non_tensor_batch["is_action_format_valid"] = np.asarray(
+                [
+                    info.get(
+                        "is_action_format_valid", info.get("is_action_valid", False)
+                    )
+                    for info in infos
+                ],
+                dtype=bool,
+            )
+            batch.non_tensor_batch["is_action_environment_valid"] = np.asarray(
+                [
+                    info.get(
+                        "is_action_environment_valid",
+                        info.get("is_action_valid", False),
+                    )
+                    for info in infos
+                ],
+                dtype=bool,
+            )
+            batch.non_tensor_batch["action_identity"] = np.asarray(
+                [info.get("action_identity") for info in infos], dtype=object
+            )
+            batch.non_tensor_batch["post_action_observation"] = np.asarray(
+                next_obs["anchor"], dtype=object
+            )
+            batch.non_tensor_batch["environment_reset_key"] = np.asarray(
+                [request.environment_reset_key for request in active_requests], dtype=object
+            )
+            batch.non_tensor_batch["task_description"] = np.asarray(
+                [request.task_description for request in active_requests], dtype=object
+            )
+            batch.non_tensor_batch["done"] = dones.astype(bool)
+            batch.non_tensor_batch["remaining_horizon"] = np.asarray(
+                [
+                    max(0, request.remaining_horizon - suffix_step - 1)
+                    for request in active_requests
+                ],
+                dtype=np.int32,
+            )
+            batch.non_tensor_batch["rewards"] = torch_to_numpy(
+                rewards, is_object=True
+            )
+            batch.non_tensor_batch["active_masks"] = np.ones(
+                len(active_indices), dtype=object
+            )
+
+            for logical_index, row in zip(active_indices, to_list_of_dict(batch)):
+                total_batch_list[logical_index].append(row)
+            for local_index, logical_index in enumerate(active_indices):
+                episode_rewards[logical_index] += float(rewards[local_index])
+                episode_lengths[logical_index] += 1
+                is_done[logical_index] = bool(is_done[logical_index] or dones[local_index])
+
+            active_size = len(active_indices)
+            dense_size = batch_size
+            elapsed = time.monotonic() - started
+            increments = {
+                "branch_suffix_generation_waves": 1,
+                "branch_suffix_active_sequences": active_size,
+                "branch_suffix_dense_equivalent_sequences": dense_size,
+                "branch_suffix_inactive_sequences_avoided": dense_size - active_size,
+                "branch_suffix_submitted_sequences": submitted_size,
+                "branch_suffix_padding_sequences": submitted_size - active_size,
+                "branch_suffix_environment_steps": active_size,
+                "branch_suffix_selected_seconds": elapsed,
+            }
+            for key, value in increments.items():
+                self.orchestration_metrics[key] = (
+                    self.orchestration_metrics.get(key, 0) + value
+                )
+            dense_total = self.orchestration_metrics[
+                "branch_suffix_dense_equivalent_sequences"
+            ]
+            self.orchestration_metrics["branch_suffix_active_efficiency"] = (
+                self.orchestration_metrics["branch_suffix_active_sequences"]
+                / dense_total
+                if dense_total
+                else 1.0
+            )
+            if self.artifact_store is not None:
+                self.artifact_store.append("branch_suffix_execution_waves", {
+                    "execution_wave": suffix_step,
+                    "active_worker_slots": active_slots,
+                    "active_branch_ids": [
+                        request.branch_id for request in active_requests
+                    ],
+                    "active_sequences": active_size,
+                    "dense_equivalent_sequences": dense_size,
+                    "submitted_sequences": submitted_size,
+                    "padding_sequences": submitted_size - active_size,
+                    "elapsed_seconds": elapsed,
+                })
+
+        effective_rows = []
+        for env_index, rows in enumerate(total_batch_list):
+            for row in rows:
+                row["episode_rewards"] = episode_rewards[env_index]
+                row["episode_lengths"] = episode_lengths[env_index]
+                row["tool_callings"] = tool_callings[env_index]
+                row["success_rate"] = float(episode_rewards[env_index] > 0)
+                effective_rows.append(row)
+        output = (
+            DataProto.from_single_dict(collate_fn(effective_rows))
+            if effective_rows
+            else None
+        )
+        return output, episode_rewards, is_done
+
+    def _execute_chunk_selected(
+        self,
+        root_output,
+        gen_batch,
+        actor_rollout_wg,
+        requests,
+        used_origins=None,
+        execution_wave=0,
+    ):
+        """Execute a frozen chunk on persistent slots without replaying successes."""
+        for target in (self.trace_diagnostics, self.orchestration_metrics):
+            target.setdefault("branch_execution_restore_replay_steps", 0)
+            target.setdefault("branch_execution_restore_replay_seconds", 0.0)
+            target.setdefault("branch_execution_restore_replay_jobs", 0)
+        for key, value in (
+            ("branch_suffix_generation_waves", 0),
+            ("branch_suffix_active_sequences", 0),
+            ("branch_suffix_dense_equivalent_sequences", 0),
+            ("branch_suffix_inactive_sequences_avoided", 0),
+            ("branch_suffix_submitted_sequences", 0),
+            ("branch_suffix_padding_sequences", 0),
+            ("branch_suffix_environment_steps", 0),
+            ("branch_suffix_selected_seconds", 0.0),
+            ("branch_suffix_active_efficiency", 1.0),
+        ):
+            self.orchestration_metrics.setdefault(key, value)
+        self.orchestration_metrics["branch_selected_worker_execution"] = 1.0
+        entries = [
+            {"slot": slot, "request": request, "result": None}
+            for slot, request in enumerate(requests)
+        ]
+        if used_origins is None:
+            used_origins = set()
+        used_origins.update(
+            entry["request"].origin_occurrence_id for entry in entries
+        )
+        for entry in entries:
+            request = entry["request"]
+            self.replay_retry_metadata.setdefault(request.request_id, {
+                "attempt": 0,
+                "fallback_level": "selected_origin",
+                "parent_request_id": None,
+                "execution_wave": int(execution_wave),
+                "worker_slot": int(entry["slot"]),
+            })
+
+        pending = list(entries)
+        root_logs = None
+        for attempt in range(self.max_origin_retries + 1):
+            if not pending:
+                break
+            slots = [entry["slot"] for entry in pending]
+            active_requests = [entry["request"] for entry in pending]
+            started = time.monotonic()
+            _, _, results = self.replay_adapter.replay_selected_and_validate(
+                slots, active_requests
+            )
+            self._trace_replay_results(
+                active_requests,
+                results,
+                f"initial_validation_{attempt}",
+                time.monotonic() - started,
+                cost_kind="validation_replay" if attempt == 0 else "retry_replay",
+            )
+            retry_entries = []
+            for entry, result in zip(pending, results):
+                entry["result"] = result
+                if result.replay_ok:
+                    continue
+                if attempt >= self.max_origin_retries:
+                    continue
+                if root_logs is None:
+                    root_logs = build_root_event_logs(root_output)
+                request = entry["request"]
+                replacement = self._fallback_request(
+                    request, root_logs, used_origins
+                )
+                if replacement is None:
+                    continue
+                used_origins.add(replacement.origin_occurrence_id)
+                self.replay_retry_metadata[replacement.request_id] = {
+                    "attempt": attempt + 1,
+                    "fallback_level": "same_anchor_action_alternate_origin",
+                    "parent_request_id": request.request_id,
+                    "execution_wave": int(execution_wave),
+                    "worker_slot": int(entry["slot"]),
+                }
+                if hasattr(self.coordinator, "adopt_retry_request"):
+                    self.coordinator.adopt_retry_request(request, replacement)
+                entry["request"] = replacement
+                entry["result"] = None
+                retry_entries.append(entry)
+            pending = retry_entries
+
+        valid_entries = [
+            entry
+            for entry in entries
+            if entry["result"] is not None and entry["result"].replay_ok
+        ]
+        failed_entries = [entry for entry in entries if entry not in valid_entries]
+        if self.artifact_store is not None:
+            for entry in failed_entries:
+                request = entry["request"]
+                result = entry["result"]
+                self.artifact_store.append("branches", {
+                    "request_id": request.request_id,
+                    "branch_id": request.branch_id,
+                    "task_id": request.task_id,
+                    "origin_occurrence_id": request.origin_occurrence_id,
+                    "selected_action": request.selected_canonical_action,
+                    "status": "replay_budget_exhausted",
+                    "failure_category": getattr(result, "category", "REPLAY_FAILED"),
+                    "failure_message": getattr(result, "error_message", ""),
+                    "worker_slot": int(entry["slot"]),
+                    **self.replay_retry_metadata.get(request.request_id, {}),
+                })
+        if failed_entries and self.variant == "batch_erv_exact":
+            raise RuntimeError(
+                "Exact Batch-ERV selected-worker replay did not realize every "
+                f"frozen branch in execution wave {execution_wave}; validated "
+                f"{len(valid_entries)} of {len(entries)} requests"
+            )
+        if not valid_entries:
+            return [], None, None, None
+
+        valid_requests = [entry["request"] for entry in valid_entries]
+        worker_slots = [entry["slot"] for entry in valid_entries]
+        started = time.monotonic()
+        next_obs, origin_rewards, origin_dones, infos = self.branch_envs.step_selected(
+            worker_slots,
+            [request.copied_raw_model_response for request in valid_requests],
+        )
+        transition_results = self.replay_adapter.validate_transitions(
+            valid_requests, next_obs, origin_rewards, origin_dones, infos
+        )
+        self._trace_replay_results(
+            valid_requests,
+            transition_results,
+            "origin_transition_validation",
+            time.monotonic() - started,
+            prefix_lengths=[1] * len(valid_requests),
+            cost_kind="origin_transition",
+        )
+        transition_valid = [
+            index
+            for index, result in enumerate(transition_results)
+            if result.replay_ok
+        ]
+        for request, slot, result in zip(
+            valid_requests, worker_slots, transition_results
+        ):
+            if result.replay_ok or self.artifact_store is None:
+                continue
+            self.artifact_store.append("branches", {
+                "request_id": request.request_id,
+                "branch_id": request.branch_id,
+                "task_id": request.task_id,
+                "origin_occurrence_id": request.origin_occurrence_id,
+                "selected_action": request.selected_canonical_action,
+                "copied_action_identity": request.copied_action_identity,
+                "status": "transition_replay_mismatch",
+                "failure_category": result.category,
+                "worker_slot": int(slot),
+            })
+        if len(transition_valid) != len(valid_requests):
+            if self.variant == "batch_erv_exact":
+                raise RuntimeError(
+                    "Exact Batch-ERV selected-worker origin transition validation "
+                    f"failed in execution wave {execution_wave}; validated "
+                    f"{len(transition_valid)} of {len(valid_requests)} requests"
+                )
+            valid_requests = [valid_requests[index] for index in transition_valid]
+            worker_slots = [worker_slots[index] for index in transition_valid]
+            next_obs = {
+                key: None if values is None else [values[index] for index in transition_valid]
+                for key, values in next_obs.items()
+            }
+            origin_rewards = np.asarray(origin_rewards).reshape(-1)[transition_valid]
+            origin_dones = np.asarray(origin_dones).reshape(-1)[transition_valid]
+        if not valid_requests:
+            return [], None, None, None
+
+        origin_rewards = np.asarray(origin_rewards).reshape(-1)
+        origin_dones = np.asarray(origin_dones).reshape(-1)
+        branch_gen_batch = gen_batch.select_idxs(
+            [request.task_batch_index for request in valid_requests]
+        )
+        suffix_started = time.monotonic()
+        suffix_output, terminal_rewards, _ = self._collect_suffixes_selected(
+            branch_gen_batch,
+            actor_rollout_wg,
+            valid_requests,
+            worker_slots,
+            origin_rewards,
+            origin_dones,
+        )
+        self.orchestration_metrics["branch_suffix_generation_seconds"] = (
+            self.orchestration_metrics.get("branch_suffix_generation_seconds", 0.0)
+            + float(time.monotonic() - suffix_started)
+        )
+        self.orchestration_metrics["branch_suffix_waves"] = (
+            self.orchestration_metrics.get("branch_suffix_waves", 0.0) + 1.0
+        )
+        self.orchestration_metrics["branch_suffix_trajectories"] = (
+            self.orchestration_metrics.get("branch_suffix_trajectories", 0.0)
+            + float(len(valid_requests))
+        )
+        self.orchestration_metrics["branch_selected_worker_execution"] = 1.0
+
+        occurrence_to_index = {
+            str(occurrence_id): index
+            for index, occurrence_id in enumerate(
+                root_output.non_tensor_batch["occurrence_id"]
+            )
+        }
+        origin_output = root_output.select_idxs([
+            occurrence_to_index[request.origin_occurrence_id]
+            for request in valid_requests
+        ])
+        origin_output.non_tensor_batch["traj_uid"] = np.asarray(
+            [request.branch_id for request in valid_requests], dtype=object
+        )
+        origin_output.non_tensor_batch["occurrence_id"] = np.asarray(
+            [f"{request.branch_id}:origin" for request in valid_requests], dtype=object
+        )
+        origin_output.non_tensor_batch["episode_rewards"] = terminal_rewards.astype(
+            np.float32
+        )
+        origin_output.non_tensor_batch["rewards"] = np.asarray(
+            origin_rewards, dtype=object
+        )
+        origin_output.non_tensor_batch["done"] = origin_dones.astype(bool)
+        self._refresh_success_rate(origin_output)
+        self._set_lineage(
+            origin_output,
+            "branch_origin",
+            [request.branch_id for request in valid_requests],
+        )
+        if suffix_output is not None:
+            self._set_lineage(
+                suffix_output,
+                "branch_suffix",
+                suffix_output.non_tensor_batch["traj_uid"],
+            )
+        return valid_requests, origin_output, suffix_output, terminal_rewards
+
+    def _execute_chunk(self, *args, **kwargs):
+        if self.branch_execution_mode == "selected_worker":
+            return self._execute_chunk_selected(*args, **kwargs)
+        return self._execute_chunk_legacy(*args, **kwargs)
 
     def _execute_round(self, root_output, gen_batch, actor_rollout_wg, requests):
         """Execute one frozen acquisition round in replay-capacity-sized waves."""

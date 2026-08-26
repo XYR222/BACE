@@ -18,7 +18,6 @@ source "${SCRIPT_DIR}/h100_job_env.sh"
 FORMAL_ROOT=/hpcwork/xsz96350/fu_project/work-BACE/experiments/alfworld-qwen2.5-1.5b-exact
 STABILITY_ROOT=${FORMAL_ROOT}/stability_profile
 stability_micro_batch=${STABILITY_MICRO_BATCH:-16}
-formal_segment_steps=${STABILITY_SEGMENT_STEPS:-20}
 formal_max_checkpoints=${STABILITY_MAX_CHECKPOINTS:-1}
 attempt_name=stability_mb${stability_micro_batch}_job${SLURM_JOB_ID}
 invocation_id=${SLURM_JOB_ID}_${attempt_name}_steps1to3
@@ -38,6 +37,8 @@ mkdir -p "${report_dir}"
 grep -Eq "training/global_step['\"]?:[[:space:]]*3|training/global_step[^0-9]+3" "${log_file}"
 python -m recipe.bace_gigpo.validate_trace "${artifact_dir}" \
     --output "${report_dir}/${attempt_name}_trace_validation.json"
+python "${SCRIPT_DIR}/validate_selected_worker_metrics.py" "${artifact_dir}" \
+    --output "${report_dir}/${attempt_name}_selected_worker.json"
 python "${SCRIPT_DIR}/analyze_host_resources.py" \
     "${metadata_dir}/host_resource_samples.csv" --max-pids 12000 \
     --warn-only \
@@ -54,8 +55,8 @@ if [[ -n "${ABORTED_FORMAL_JOB_ID:-}" ]]; then
         "${ABORTED_FORMAL_JOB_ID}"
 fi
 
-bash "${SCRIPT_DIR}/submit_alfworld_h100_chain.sh" \
-    --segment-steps "${formal_segment_steps}" \
+bash "${SCRIPT_DIR}/submit_alfworld_h100_4gpu_rolling.sh" \
+    --target-step 150 \
     --micro-batch "${stability_micro_batch}" \
     --max-checkpoints "${formal_max_checkpoints}" \
     --dependency-job "${SLURM_JOB_ID}"

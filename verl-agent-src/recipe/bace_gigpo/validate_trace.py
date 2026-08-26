@@ -6,6 +6,8 @@ import math
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
+
 from .artifacts import SCHEMA_VERSION
 
 
@@ -23,6 +25,23 @@ def _close_sequence(left, right, tolerance=1e-7):
     if left is None or right is None or len(left) != len(right):
         return False
     return all(math.isclose(float(a), float(b), rel_tol=0.0, abs_tol=tolerance) for a, b in zip(left, right))
+
+
+def _float32_advantage_sum(macro: float, local: float, weight: float) -> tuple[float, float]:
+    """Reconstruct the two float32 tensor ops used by advantage.py.
+
+    Artifact components are serialized after each tensor has already rounded to
+    float32.  Re-adding those values in Python float64 can differ from the
+    recorded float32 combined value by one or two ULPs.  Compare against the
+    actual training dtype and allow two ULPs, while retaining a small absolute
+    floor around zero.
+    """
+    macro32 = np.float32(macro)
+    local32 = np.float32(local)
+    weight32 = np.float32(weight)
+    expected32 = np.float32(macro32 + np.float32(weight32 * local32))
+    ulp = abs(float(np.spacing(expected32)))
+    return float(expected32), max(1e-6, 2.0 * ulp)
 
 
 def validate_step(step_dir: Path, max_recomputed_logprob_diff=None,
@@ -115,6 +134,43 @@ def validate_step(step_dir: Path, max_recomputed_logprob_diff=None,
         for record in replay
         if "transition_validation" in record["phase"] and record["result"]["replay_ok"]
     }
+    if manifest.get("branch_execution_mode") == "selected_worker":
+        metrics = summary.get("bace_metrics", {})
+        diagnostics = summary.get("diagnostics", {})
+        requested = int(metrics.get("requested", 0))
+        if requested:
+            restore_steps = int(metrics.get("branch_execution_restore_replay_steps", -1))
+            if restore_steps != 0:
+                errors.append(
+                    "selected-worker execution performed an execution-restore replay"
+                )
+            active = int(metrics.get("branch_suffix_active_sequences", -1))
+            dense = int(metrics.get("branch_suffix_dense_equivalent_sequences", -1))
+            avoided = int(metrics.get("branch_suffix_inactive_sequences_avoided", -1))
+            suffix_steps = int(metrics.get("branch_suffix_environment_steps", -1))
+            if min(active, dense, avoided, suffix_steps) < 0:
+                errors.append("selected-worker suffix accounting is incomplete")
+            elif active + avoided != dense:
+                errors.append("selected-worker suffix accounting does not conserve sequences")
+            elif suffix_steps != active:
+                errors.append("selected-worker suffix environment steps differ from active sequences")
+            mechanical = int(diagnostics.get("branch_total_mechanical_replay_steps", -1))
+            origin = int(diagnostics.get("branch_origin_transition_steps", -1))
+            total = int(diagnostics.get("branch_total_environment_steps", -1))
+            compatibility_total = int(diagnostics.get("replay_environment_steps", -1))
+            if min(mechanical, origin, total, compatibility_total) < 0:
+                errors.append("selected-worker replay accounting is incomplete")
+            elif mechanical + origin != total or compatibility_total != total:
+                errors.append("selected-worker replay accounting does not conserve environment steps")
+            checks["selected_worker_execution"] = {
+                "execution_restore_replay_steps": restore_steps,
+                "active_suffix_sequences": active,
+                "dense_equivalent_suffix_sequences": dense,
+                "inactive_sequences_avoided": avoided,
+                "mechanical_replay_steps": mechanical,
+                "origin_transition_steps": origin,
+                "total_branch_environment_steps": total,
+            }
     branches = streams.get("branches", [])
     successful_branches = {}
     failed_branch_ids = set()
@@ -170,12 +226,8 @@ def validate_step(step_dir: Path, max_recomputed_logprob_diff=None,
                 )
                 continue
             macro, local, combined = map(float, values)
-            if not math.isclose(
-                combined,
-                macro + step_advantage_w * local,
-                rel_tol=0.0,
-                abs_tol=1e-6,
-            ):
+            expected, tolerance = _float32_advantage_sum(macro, local, step_advantage_w)
+            if not math.isclose(combined, expected, rel_tol=0.0, abs_tol=tolerance):
                 errors.append(
                     f"occurrence {occurrence.get('occurrence_id')}: inconsistent advantage components"
                 )
