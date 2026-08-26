@@ -1,5 +1,7 @@
 # BACE A100 过渡设备迁移说明
 
+> **状态提示（2026-08-26）：旧设备迁移记录。** 本文不是当前进度或通用安装指南。请优先阅读 [`docs/README.md`](docs/README.md) 和 [`docs/02_新设备安装与首次运行.md`](docs/02_新设备安装与首次运行.md)。
+
 ## 1. 为什么先用 A100
 
 A100 与 H100 都是 NVIDIA CUDA 平台，可以先验证绝大多数高风险内容：PyTorch CUDA、vLLM、Ray worker、NCCL、ALFWorld 环境、BACE 序贯 rollout、Replay identity、BatchERV Exact、artifact 保存和 checkpoint。H100 阶段主要再做显存、吞吐和并行度调优。

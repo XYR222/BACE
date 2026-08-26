@@ -1,5 +1,7 @@
 # BACE H100 可迁移工程包
 
+> **状态提示（2026-08-26）：旧 RWTH/H100 部署记录。** 路径、依赖和阶段性进度不再是当前交接口径。换设备请从 [`docs/README.md`](docs/README.md) 开始；本文仅用于追溯原环境。
+
 本目录是 `/home/naie/work/work-BACE` 在 2026-08-14 的代码迁移副本，并新增了独立的 CUDA/H100 运行层。原有 BACE、BatchERV Exact、legacy、NPU 脚本和历史文档均保留，没有删除或替换原逻辑。本次 A100 过渡包有意不携带大模型和完整 ALFWorld 数据，详见 [README_A100_TRANSITION.md](README_A100_TRANSITION.md)。
 
 ## 已随包携带的内容

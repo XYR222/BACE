@@ -1,5 +1,7 @@
 # ALFWorld Snapshot 实现过程说明
 
+> **状态提示（2026-08-26）：历史/设计记录。** 本文描述的 `snapshot/state_id.py`、`StateIDSnapshotBackend` 和 `get_state_id/set_state_id` 当前不在本 Git tree 中，不能按已实现功能使用。当前有效实现仍是 prefix/fast replay。请先阅读 [`docs/01_当前实现状态与未完成事项.md`](docs/01_当前实现状态与未完成事项.md) 和 [`docs/06_文档有效性清单.md`](docs/06_文档有效性清单.md)。
+
 本文说明当前 BACE-GiGPO 中 ALFWorld snapshot 的实现思路、代码改动、运行流程、关键校验和已知限制。这里的 snapshot 只用于加速 branch 恢复，不改变 BACE 的 anchor、ERV、branch 分配、优势或 loss 定义。
 
 ## 1. 目标与基本原则
