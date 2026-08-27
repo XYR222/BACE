@@ -30,6 +30,7 @@
 - `verl-agent-src/`：迁入的 verl-agent 源码、BACE 实现、入口和测试。
 - `deploy/`：CUDA 环境安装与 GPU/资产 preflight。
 - `docs/`：当前维护口径和换设备交接文档。
+- `target/`：已版本化的实验分析、历史问题记录和辅助工具；先看 `target/README.md` 的分级。
 - `BACE-work-2/`：较新的方法设计背景，不是当前状态台账。
 - `BACE-work/`、`issues/`：早期实现和问题调查记录。
 - 根目录旧 H100/A100、StateID 和 GiGPO reference 文档：历史部署或独立设计资料，使用前先查文档清单。

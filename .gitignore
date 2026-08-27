@@ -1,7 +1,13 @@
 # Local experiment products and paper workspace
 /experiments/
 /ICLR2027/
-/target/
+# Keep human-authored target notes and analysis tools, but not generated caches.
+/target/*
+!/target/*.md
+!/target/*.py
+!/target/*.sh
+/target/__pycache__/
+/target/*.pyc
 /BACE-work/experiment_traces/
 
 # Keep this public snapshot focused on the BACE/ALFWorld debugging path rather

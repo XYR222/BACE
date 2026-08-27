@@ -16,7 +16,7 @@
 
 ## 可选的实验分析
 
-[BACE 与 GiGPO 150-step TensorBoard 对比分析](../target/BACE_vs_GiGPO_150step_TensorBoard对比分析_2026-08-27.md) 是一次单 seed 的经验对比报告。它用于理解后期 branch/root 比例、validation 差异和系统成本，不是方法规范，也不能替代多 seed 消融实验。该文件是 `target/` 中唯一纳入 Git 的公开 Markdown；其余临时分析仍被忽略。
+[`target/` 分析与历史材料索引](../target/README.md) 对公开的实验分析、问题修复记录、初始任务输入和辅助脚本逐项分级。其中 [BACE 与 GiGPO 150-step TensorBoard 对比分析](../target/BACE_vs_GiGPO_150step_TensorBoard对比分析_2026-08-27.md) 是单 seed 经验报告，用于理解后期 branch/root 比例、validation 差异和系统成本，不是方法规范，也不能替代多 seed 消融实验。
 
 ## 一分钟结论
 
