@@ -14,6 +14,10 @@
 8. [代码库阅读路线](08_代码库阅读路线.md)：从 launcher 到 trainer、collector、方法模块和测试的最短阅读路径。
 9. [逻辑模式与兼容边界](09_逻辑模式与兼容边界.md)：区分 Exact 主线、legacy、frontier、selected-worker 和兼容默认。
 
+## 可选的实验分析
+
+[BACE 与 GiGPO 150-step TensorBoard 对比分析](../target/BACE_vs_GiGPO_150step_TensorBoard对比分析_2026-08-27.md) 是一次单 seed 的经验对比报告。它用于理解后期 branch/root 比例、validation 差异和系统成本，不是方法规范，也不能替代多 seed 消融实验。该文件是 `target/` 中唯一纳入 Git 的公开 Markdown；其余临时分析仍被忽略。
+
 ## 一分钟结论
 
 - 旧主实验已经完成 150 个训练 step，最终 validation success rate 87.50%。
