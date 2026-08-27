@@ -10,6 +10,9 @@
 4. [代码结构与数据流程](03_代码结构与数据流程.md)：natural root、Exact Batch-ERV、branch Replay、advantage、checkpoint 和 trace。
 5. [资产与实验结果迁移清单](04_资产与实验结果迁移清单.md)：GitHub 不包含什么，续跑旧实验还需复制什么。
 6. [验证验收与故障排查](05_验证验收与故障排查.md)：从单测到长跑的门禁和常见故障。
+7. [当前 BACE 方法规范](07_当前BACE方法规范.md)：用当前代码口径解释预算、competence、Exact Batch-ERV、Replay、advantage 和 checkpoint。
+8. [代码库阅读路线](08_代码库阅读路线.md)：从 launcher 到 trainer、collector、方法模块和测试的最短阅读路径。
+9. [逻辑模式与兼容边界](09_逻辑模式与兼容边界.md)：区分 Exact 主线、legacy、frontier、selected-worker 和兼容默认。
 
 ## 一分钟结论
 
