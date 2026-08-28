@@ -136,6 +136,77 @@ def compute_step_discounted_returns(batch: DataProto, gamma: float):
     return all_returns
 
 # ---------------------------------------------------------- #
+# Stable normalization helpers (legacy functions below remain intact)
+# ---------------------------------------------------------- #
+def _stable_group_normalize(scores, group_ids, epsilon, remove_std, singleton_mean_zero=False):
+    if scores.ndim != 1:
+        raise ValueError(f"group normalization expects 1-D scores, got {tuple(scores.shape)}")
+    grouped = defaultdict(list)
+    for i, group_id in enumerate(group_ids):
+        grouped[group_id].append(i)
+    scores64 = scores.detach().to(dtype=torch.float64)
+    out64 = torch.empty_like(scores64)
+    with torch.no_grad():
+        for group_id, positions in grouped.items():
+            values = scores64[positions]
+            if len(positions) == 1:
+                mean = torch.zeros((), dtype=torch.float64, device=scores.device) if singleton_mean_zero else values[0]
+                std = torch.ones((), dtype=torch.float64, device=scores.device)
+            else:
+                mean = values.mean()
+                std = values.std(unbiased=True)
+            centered = values - mean
+            if (not torch.isfinite(std)) or bool(std <= 1e-12):
+                normalized = torch.zeros_like(centered)
+            elif remove_std:
+                normalized = centered
+            else:
+                normalized = centered / (std + float(epsilon))
+            out64[positions] = normalized
+    return out64.to(dtype=scores.dtype)
+
+
+def episode_norm_reward_stable(token_level_rewards, response_mask, index, traj_index,
+                               epsilon=1e-6, remove_std=True,
+                               compute_mean_std_cross_steps=True):
+    response_length = token_level_rewards.shape[-1]
+    scores = token_level_rewards.sum(dim=-1)
+    scores64 = scores.detach().to(dtype=torch.float64)
+    stats = defaultdict(list)
+    seen_pairs = set()
+    for i in range(scores.shape[0]):
+        pair = (index[i], traj_index[i])
+        if compute_mean_std_cross_steps or pair not in seen_pairs:
+            stats[index[i]].append(i)
+            seen_pairs.add(pair)
+    out64 = torch.empty_like(scores64)
+    with torch.no_grad():
+        for group_id, positions in stats.items():
+            values = scores64[positions]
+            if len(positions) == 1:
+                mean = torch.zeros((), dtype=torch.float64, device=scores.device)
+                std = torch.ones((), dtype=torch.float64, device=scores.device)
+            else:
+                mean = values.mean()
+                std = values.std(unbiased=True)
+            all_positions = [i for i, gid in enumerate(index) if gid == group_id]
+            centered = scores64[all_positions] - mean
+            if (not torch.isfinite(std)) or bool(std <= 1e-12):
+                normalized = torch.zeros_like(centered)
+            elif remove_std:
+                normalized = centered
+            else:
+                normalized = centered / (std + float(epsilon))
+            out64[all_positions] = normalized
+    return out64.to(dtype=scores.dtype).unsqueeze(-1).tile([1, response_length]) * response_mask
+
+
+def step_norm_reward_stable(step_rewards, response_mask, index, epsilon=1e-6, remove_std=True):
+    scores = _stable_group_normalize(step_rewards, index, epsilon, remove_std)
+    return scores.unsqueeze(-1).tile([1, response_mask.shape[-1]]) * response_mask
+
+
+# ---------------------------------------------------------- #
 # ---------------- Core Functions of GiGPO ----------------- #
 # ---------------------------------------------------------- #
 
@@ -163,7 +234,7 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
         raise ValueError(f"Unknown mode: {mode}")
     
     # Compute episode relative advantages (Eq. 3 in the paper).
-    episode_advantages = episode_norm_reward(
+    episode_advantages = episode_norm_reward_stable(
         token_level_rewards,
         response_mask,
         index,
@@ -177,7 +248,7 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
     step_group_uids = build_step_group(anchor_obs, index, enable_similarity, similarity_thresh)
 
     # Compute step relative advantages (Eq. 7 in the paper).
-    step_advantages = step_norm_reward(step_rewards, response_mask, step_group_uids, epsilon, remove_std)
+    step_advantages = step_norm_reward_stable(step_rewards, response_mask, step_group_uids, epsilon, remove_std)
 
     # Compute joint advantages (Eq. 8 in the paper).
     scores = episode_advantages + step_advantage_w * step_advantages

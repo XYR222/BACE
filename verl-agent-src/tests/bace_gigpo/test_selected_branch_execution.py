@@ -304,3 +304,131 @@ def test_legacy_executor_remains_available():
     collector._execute_chunk_legacy = lambda *args, **kwargs: "legacy"
     collector._execute_chunk_selected = lambda *args, **kwargs: "selected"
     assert collector._execute_chunk() == "legacy"
+
+
+def test_selected_main_reuse_executes_on_task_local_physical_slots():
+    requests = [_request(0), _request(1), _request(2)]
+    requests[0].task_batch_index = 2
+    requests[1].task_batch_index = 2
+    requests[2].task_batch_index = 5
+
+    class Replay:
+        def __init__(self):
+            self.slots = None
+
+        def replay_selected_and_validate(self, slots, selected):
+            self.slots = list(slots)
+            return None, None, [_result(request) for request in selected]
+
+        def validate_transitions(self, selected, observations, rewards, dones, infos):
+            del observations, rewards, dones, infos
+            return [_result(request) for request in selected]
+
+    class Envs:
+        replay_capacity = 128
+
+        def __init__(self):
+            self.slots = None
+
+        def step_selected(self, slots, actions):
+            del actions
+            self.slots = list(slots)
+            return (
+                {"anchor": [f"post-{slot}" for slot in slots]},
+                np.zeros(len(slots)),
+                np.ones(len(slots), dtype=bool),
+                [{} for _ in slots],
+            )
+
+    replay = Replay()
+    envs = Envs()
+    collector, root_output = _selected_collector(requests, replay, envs)
+    collector.branch_pool_mode = "main_reuse"
+    collector.main_group_size = 8
+
+    collector._execute_chunk_selected(
+        root_output, _FakeGenBatch(6), None, requests
+    )
+
+    assert replay.slots == [16, 17, 40]
+    assert envs.slots == [16, 17, 40]
+
+
+def test_dedicated_and_main_reuse_preserve_deterministic_branch_semantics():
+    requests = [_request(index) for index in range(4)]
+    for index, request in enumerate(requests):
+        request.task_batch_index = index // 2
+
+    def execute(pool_mode):
+        replayed = []
+        transitions = []
+
+        class Replay:
+            def replay_selected_and_validate(self, slots, selected):
+                replayed.extend(
+                    (
+                        request.request_id,
+                        request.environment_reset_key,
+                        request.parsed_action_prefix,
+                        request.selected_canonical_action,
+                        request.copied_raw_model_response,
+                    )
+                    for request in selected
+                )
+                return None, None, [_result(request) for request in selected]
+
+            def validate_transitions(
+                self, selected, observations, rewards, dones, infos
+            ):
+                del observations, rewards, dones, infos
+                transitions.extend(request.request_id for request in selected)
+                return [_result(request) for request in selected]
+
+        class Envs:
+            replay_capacity = 128
+
+            def step_selected(self, slots, actions):
+                size = len(slots)
+                return (
+                    {"anchor": [f"post-{index}" for index in range(size)]},
+                    np.arange(size, dtype=np.float32),
+                    np.ones(size, dtype=bool),
+                    [{} for _ in range(size)],
+                )
+
+        collector, root_output = _selected_collector(requests, Replay(), Envs())
+        collector.branch_pool_mode = pool_mode
+        collector.main_group_size = 8
+        valid, _, _, rewards = collector._execute_chunk_selected(
+            root_output, _FakeGenBatch(4), None, requests
+        )
+        return (
+            [request.branch_id for request in valid],
+            replayed,
+            transitions,
+            rewards.tolist(),
+        )
+
+    assert execute("dedicated") == execute("main_reuse")
+
+
+def test_main_reuse_branch_pool_is_borrowed_but_dedicated_pool_is_closed():
+    class Pool:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    reused = Pool()
+    collector = object.__new__(BaceTrajectoryCollector)
+    collector.branch_envs = reused
+    collector.branch_pool_owns_resources = False
+    collector.close_branch_pool()
+    assert reused.close_calls == 0
+
+    dedicated = Pool()
+    collector.branch_envs = dedicated
+    collector.branch_pool_owns_resources = True
+    collector.close_branch_pool()
+    assert dedicated.close_calls == 1

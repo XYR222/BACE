@@ -48,6 +48,31 @@ def test_disabled_mode_is_configurable_at_caller(tmp_path):
     assert (store.step_dir / "summary.json").exists()
 
 
+def test_rollout_generation_metrics_exclude_copied_branch_origins():
+    batch = DataProto.from_single_dict({
+        "responses": torch.ones((4, 4), dtype=torch.long),
+        "attention_mask": torch.tensor([
+            [1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1],
+        ]),
+        "source_type": np.asarray(
+            ["root", "root", "branch_origin", "branch_suffix"],
+            dtype=object,
+        ),
+    })
+
+    metrics = BaceTrajectoryCollector._rollout_generation_metrics(batch)
+
+    assert metrics == {
+        "root_generated_tokens": 6,
+        "branch_generated_tokens": 4,
+        "root_generated_occurrences": 2,
+        "branch_generated_occurrences": 1,
+    }
+
+
 def build_valid_trace(tmp_path):
     store = BaceArtifactStore(tmp_path, 3, {
         "total_leaf_budget": 2,

@@ -49,6 +49,18 @@ class FakeCollector:
         self.loaded = state
 
 
+class FakeMigrationCollector(FakeCollector):
+    def checkpoint_migration_metadata(self, source_checkpoint, source_global_step):
+        return {
+            "migration_mode": "diagnostic_only",
+            "source_checkpoint": source_checkpoint,
+            "source_global_step": source_global_step,
+            "allowed_diff": {
+                "min_natural_roots": {"saved": 2, "current": 4}
+            },
+        }
+
+
 def make_trainer(checkpoint_dir):
     trainer = object.__new__(RayPPOTrainer)
     trainer.config = OmegaConf.create({
@@ -110,7 +122,43 @@ def test_dynamic_bace_resume_rejects_missing_or_mismatched_state(tmp_path):
         make_trainer(tmp_path)._load_checkpoint()
 
 
-def bare_collector(threshold=0.005, tie_break_identity_mode="legacy_uuid"):
+def test_trainer_writes_migration_metadata_only_to_distinct_output(tmp_path):
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    source = make_trainer(source_root)
+    source._save_checkpoint()
+    source_step = source_root / "global_step_3"
+
+    restored = make_trainer(destination_root)
+    restored.config.trainer.resume_mode = "resume_path"
+    restored.config.trainer.resume_from_path = str(source_step)
+    restored.traj_collector = FakeMigrationCollector()
+    restored.global_steps = 0
+    restored._load_checkpoint()
+
+    metadata_path = destination_root / "checkpoint_migration.json"
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["migration_mode"] == "diagnostic_only"
+    assert metadata["source_global_step"] == 3
+    assert restored.actor_rollout_wg.loaded_path == str(source_step / "actor")
+    assert not (source_root / "checkpoint_migration.json").exists()
+
+    unsafe = make_trainer(source_root)
+    unsafe.config.trainer.resume_mode = "resume_path"
+    unsafe.config.trainer.resume_from_path = str(source_step)
+    unsafe.traj_collector = FakeMigrationCollector()
+    unsafe.global_steps = 0
+    with pytest.raises(ValueError, match="distinct output directory"):
+        unsafe._load_checkpoint()
+    assert unsafe.actor_rollout_wg.loaded_path is None
+
+
+def bare_collector(
+    threshold=0.005,
+    tie_break_identity_mode="legacy_uuid",
+    min_natural_roots=2,
+    migration_enabled=False,
+):
     collector = object.__new__(BaceTrajectoryCollector)
     collector.variant = "batch_erv_exact"
     collector.topology = "dynamic"
@@ -124,8 +172,16 @@ def bare_collector(threshold=0.005, tie_break_identity_mode="legacy_uuid"):
         min_strength=2.0,
         max_strength=8.0,
     )
-    collector.parameter_signature = {"batch_erv_threshold": threshold}
+    collector.parameter_signature = {
+        "batch_erv_threshold": threshold,
+        "min_natural_roots": min_natural_roots,
+    }
     collector.tie_break_identity_mode = tie_break_identity_mode
+    collector.checkpoint_migration_enabled = migration_enabled
+    collector.checkpoint_migration_mode = (
+        "diagnostic_rmin2_to4" if migration_enabled else "strict"
+    )
+    collector.last_checkpoint_migration = None
     if tie_break_identity_mode != "legacy_uuid":
         collector.parameter_signature["tie_break_identity_mode"] = tie_break_identity_mode
     return collector
@@ -159,3 +215,45 @@ def test_collector_checkpoint_rejects_tie_break_identity_mode_change():
         )
     with pytest.raises(ValueError, match="parameter signature"):
         bare_collector().load_state_dict(stable_payload)
+
+
+def test_diagnostic_checkpoint_migration_allows_only_rmin2_to4():
+    source = bare_collector(min_natural_roots=2)
+    source.competence_history.update({"heat": [True, False, True]})
+    payload = json.loads(json.dumps(source.state_dict()))
+
+    migrated = bare_collector(
+        min_natural_roots=4, migration_enabled=True
+    )
+    migrated.load_state_dict(payload)
+    assert migrated.current_step == source.current_step
+    assert migrated.competence_history.snapshot() == source.competence_history.snapshot()
+    metadata = migrated.checkpoint_migration_metadata(
+        "/source/global_step_7", 7
+    )
+    assert metadata["migration_mode"] == "diagnostic_only"
+    assert metadata["allowed_diff"] == {
+        "min_natural_roots": {"saved": 2, "current": 4}
+    }
+    assert len(metadata["source_competence_history_sha256"]) == 64
+
+    strict = bare_collector(min_natural_roots=4)
+    with pytest.raises(ValueError, match="parameter signature"):
+        strict.load_state_dict(payload)
+
+    extra_difference = bare_collector(
+        threshold=0.01,
+        min_natural_roots=4,
+        migration_enabled=True,
+    )
+    with pytest.raises(ValueError, match="parameter signature"):
+        extra_difference.load_state_dict(payload)
+
+    reverse_payload = json.loads(json.dumps(
+        bare_collector(min_natural_roots=4).state_dict()
+    ))
+    reverse = bare_collector(
+        min_natural_roots=2, migration_enabled=True
+    )
+    with pytest.raises(ValueError, match="parameter signature"):
+        reverse.load_state_dict(reverse_payload)

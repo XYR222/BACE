@@ -24,6 +24,10 @@ class TaskTopology:
     family_controller_strength: float | None = None
     correction_count: int = 0
     information_capacity: int | None = None
+    initial_information_capacity: int | None = None
+    initial_structural_anchor_count: int | None = None
+    initial_quota_deficit: int | None = None
+    initial_normalized_quota_deficit: float | None = None
     global_batch_value: float | None = None
 
 
@@ -260,6 +264,10 @@ class ExactBatchTaskState:
     structural_anchor_count: int = 0
     information_capacity: int = 0
     correction_count: int = 0
+    initial_information_capacity: int | None = None
+    initial_structural_anchor_count: int | None = None
+    initial_quota_deficit: int | None = None
+    initial_normalized_quota_deficit: float | None = None
     anchor_designs: dict[str, AnchorBatchDesign] | None = None
 
 
@@ -367,6 +375,20 @@ class ExactBatchTopologyPlanner:
         need_more_roots = set()
         for task_id, state in states.items():
             self._assess_task(roots_by_task.get(task_id, []), state)
+            if state.initial_information_capacity is None:
+                state.initial_information_capacity = state.information_capacity
+                state.initial_structural_anchor_count = (
+                    state.structural_anchor_count
+                )
+                state.initial_quota_deficit = max(
+                    0,
+                    state.planned_branch_count
+                    - state.initial_information_capacity,
+                )
+                state.initial_normalized_quota_deficit = (
+                    state.initial_quota_deficit
+                    / max(state.planned_branch_count, 1)
+                )
             if state.branch_count > 0 and state.information_capacity < state.branch_count:
                 state.root_count += 1
                 state.branch_count -= 1
@@ -407,6 +429,12 @@ class ExactBatchTopologyPlanner:
                 ),
                 correction_count=state.correction_count,
                 information_capacity=state.information_capacity,
+                initial_information_capacity=state.initial_information_capacity,
+                initial_structural_anchor_count=state.initial_structural_anchor_count,
+                initial_quota_deficit=state.initial_quota_deficit,
+                initial_normalized_quota_deficit=(
+                    state.initial_normalized_quota_deficit
+                ),
             )
         return TopologyPlan(roots=tuple(selected_roots), tasks=tasks)
 

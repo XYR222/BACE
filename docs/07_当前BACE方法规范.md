@@ -18,6 +18,15 @@ BACE-GiGPO
   + occurrence local credit
 ```
 
+新实验的推荐物理执行配置再加上：
+
+```text
+branch_pool_mode=main_reuse
+root_active_executor=true
+```
+
+这两个 P1-S 开关只改变 worker/padding 调度，不改变冻结的 R/Q、anchor、Exact allocation 或训练 occurrence 语义。`dedicated/false` 旧路径仍保留作 correctness fallback。
+
 ## 2. 基本对象
 
 ### Task、root 与 occurrence
@@ -186,7 +195,9 @@ Coordinator 一次冻结该 task 的全部 Exact requests。执行层可以把 r
 
 如果某个选定 origin 的 Replay 校验失败，允许在同一冻结 anchor/action 内选择另一个未被 reservation 的 natural origin 重试；该替换会保留 branch identity 和 acquisition allocation，并显式记录 parent request、attempt 和 fallback origin。它不是重新计算 Batch-ERV，也不能换 action 或减少 quota。超过 `max_origin_retries` 后仍失败，Exact step 直接失败。
 
-当前推荐 `selected_worker`：只恢复和推进本 chunk 实际使用的 Replay workers；terminal 或 horizon 耗尽的 suffix slot 会从后续生成 wave 中压缩掉。`legacy_dense` 仍保留作兼容对照，但不是当前推荐执行器。
+当前推荐 `selected_worker`：只恢复和推进本 chunk 实际使用的 Replay workers；terminal 或 horizon 耗尽的 suffix slot 会从后续生成 wave 中压缩掉。配合 `main_reuse` 时，branch 借用 main rollout pool 的 task-local physical slots；若请求超过单 cohort 容量，仍按冻结请求安全分波执行。`legacy_dense` 和独立 `dedicated` pool 保留作兼容对照。
+
+`root_active_executor=true` 在每个 root generation wave 前只提交尚未完成的 logical roots，并将结果 scatter 回原位置；多卡 padding 仅满足张量整除，不能产生假的 environment transition 或训练样本。
 
 当前恢复后端是 ALFWorld prefix/fast replay。根目录 StateID 文档描述的 snapshot backend 不在当前代码中。
 
@@ -209,7 +220,7 @@ Coordinator 一次冻结该 task 的全部 Exact requests。执行层可以把 r
 - `branch_origin`：复制 natural origin 的 response token、loss mask 和 rollout old log-prob；
 - `branch_suffix`：origin 之后新生成的 occurrences。
 
-BACE advantage 复用 GiGPO 的 task/trajectory macro credit 和 observation step group：
+BACE advantage 复用 GiGPO 的 task/trajectory macro credit 和 observation step group。group normalization 使用 float64 中间统计处理均值和样本标准差，再转回原 tensor dtype，以稳定近零方差和较大 reward 的情况：
 
 ```text
 A_occurrence = A_macro + step_advantage_w * A_local
@@ -250,6 +261,10 @@ dynamic BACE checkpoint 必须同时包含同一 global step 的：
 - `latest_checkpointed_iteration.txt`。
 
 tracker 只有在上述状态落盘后才原子更新。非零 step 恢复缺少或不匹配 BACE state 时必须 fail-fast，不能静默重置 history。
+
+FSDP actor 轮转在新保存完整后执行，而且删除候选必须属于当前目标 checkpoint root。从另一个实验目录读取的 resume checkpoint 是只读源，不能因目标 run 的 retention policy 被删除。
+
+当前只提供一个诊断性签名迁移：`diagnostic_rmin2_to4`。它只允许把 `min_natural_roots` 从 2 改为 4，要求独立目标目录，并记录 migration metadata 与 history digest；它不改变 history 内容，也不是正式主线默认或任意签名兼容机制。
 
 ## 11. 方法不声称什么
 

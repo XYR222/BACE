@@ -1,13 +1,9 @@
 # Local experiment products and paper workspace
 /experiments/
 /ICLR2027/
-# Keep human-authored target notes and analysis tools, but not generated caches.
-/target/*
-!/target/*.md
-!/target/*.py
-!/target/*.sh
-/target/__pycache__/
-/target/*.pyc
+# Human-authored analysis now lives in BACE-results-vanilla/, improve-plan/,
+# GiGPO_reference_analysis/, and issues_old/. Global cache/output rules below
+# exclude their generated products without hiding the source documents.
 /BACE-work/experiment_traces/
 
 # Keep this public snapshot focused on the BACE/ALFWorld debugging path rather

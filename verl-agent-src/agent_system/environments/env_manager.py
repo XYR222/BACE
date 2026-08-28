@@ -219,6 +219,14 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         images = self.envs.getobs_selected(worker_indices) if self.envs.multi_modal else None
         return self._selected_observations(worker_indices, images, init=False)
 
+    def get_tasks_selected(self, worker_indices):
+        """Return logical task descriptions for caller-selected worker slots."""
+        worker_indices = [int(index) for index in worker_indices]
+        missing = [index for index in worker_indices if index not in self._bace_slots]
+        if missing:
+            raise ValueError(f"BACE slots have not been reset: {missing}")
+        return [self._bace_slots[index]['task'] for index in worker_indices]
+
     def replay_selected(self, worker_indices, requests):
         """Restore prefixes on unused sibling slots and rebuild per-slot memory."""
         worker_indices = [int(index) for index in worker_indices]

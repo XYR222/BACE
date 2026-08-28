@@ -1,4 +1,4 @@
-# `target/` 分析与历史材料索引
+# 旧 BACE 结果、分析与历史材料索引
 
 > 本目录现在纳入 GitHub，但它不是当前方法规范的入口。先读 [`docs/README.md`](../docs/README.md)；本目录用于保存已经复核的实验分析、问题演化记录和辅助工具。文件名日期表示材料形成时间，不表示它仍描述当前代码状态。
 
@@ -42,4 +42,4 @@
 
 ## 不纳入 Git 的内容
 
-`target/__pycache__/` 和 `*.pyc` 是特定 Python 版本生成的缓存，不能作为源码、结果或可复现证据，因此继续由 `.gitignore` 排除。分析脚本生成的 PNG、CSV、JSON 和 TensorBoard 数据应放在 `experiments/` 或独立结果归档，不应继续堆入本目录。
+`__pycache__/` 和 `*.pyc` 是特定 Python 版本生成的缓存，不能作为源码、结果或可复现证据，因此继续由 `.gitignore` 排除。分析脚本生成的 PNG、CSV、JSON 和 TensorBoard 数据应放在 `experiments/` 或独立结果归档，不应继续堆入本目录。

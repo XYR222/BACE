@@ -1076,6 +1076,30 @@ class RayPPOTrainer:
                 if not isinstance(collector_state, dict):
                     raise ValueError("BACE collector checkpoint has no valid collector state")
 
+        # Validate and restore controller state before loading multi-gigabyte
+        # actor shards.  A forbidden diagnostic migration must fail without
+        # partially mutating the actor, optimizer, scheduler, or dataloader.
+        if collector_state is not None:
+            self.traj_collector.load_state_dict(collector_state)
+        migration_metadata = None
+        migration_metadata_fn = getattr(
+            self.traj_collector, "checkpoint_migration_metadata", None
+        )
+        if callable(migration_metadata_fn):
+            migration_metadata = migration_metadata_fn(
+                global_step_folder, self.global_steps
+            )
+        if migration_metadata is not None:
+            source_root = os.path.realpath(os.path.dirname(global_step_folder))
+            destination_root = os.path.realpath(
+                self.config.trainer.default_local_dir
+            )
+            if source_root == destination_root:
+                raise ValueError(
+                    "Diagnostic checkpoint migration requires a distinct output "
+                    "directory so the source checkpoint remains read-only"
+                )
+
         # Only after all step-coupled state is readable do we mutate the live
         # trainer. A failure below aborts the process instead of continuing with
         # a partially restored dynamic controller.
@@ -1095,8 +1119,18 @@ class RayPPOTrainer:
                 f"Warning: No dataloader state found at {dataloader_local_path}, "
                 "will start from scratch"
             )
-        if collector_state is not None:
-            self.traj_collector.load_state_dict(collector_state)
+        if migration_metadata is not None:
+            os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
+            migration_path = os.path.join(
+                self.config.trainer.default_local_dir,
+                "checkpoint_migration.json",
+            )
+            temporary_path = f"{migration_path}.tmp-{uuid.uuid4().hex}"
+            with open(temporary_path, "w", encoding="utf-8") as stream:
+                json.dump(migration_metadata, stream, indent=2, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, migration_path)
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""

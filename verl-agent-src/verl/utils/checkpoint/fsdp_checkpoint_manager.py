@@ -14,6 +14,7 @@
 
 import os
 import warnings
+from pathlib import Path
 from typing import Optional, Union
 
 import torch
@@ -76,6 +77,18 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             checkpoint_contents=checkpoint_contents,
         )
 
+    @staticmethod
+    def _destination_owned_previous_paths(
+        previous_paths: list[str], local_path: str
+    ) -> list[str]:
+        """Keep only rotation candidates below the current checkpoint root."""
+        target_root = Path(local_path).resolve().parent.parent
+        return [
+            path
+            for path in previous_paths
+            if Path(path).resolve().parent.parent == target_root
+        ]
+
     def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
         """
         Load an FSDP checkpoint for this rank.
@@ -136,6 +149,25 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             local_path
         )
 
+    def _record_successful_save_and_rotate(
+        self, local_path: str, max_ckpt_to_keep: int | None
+    ) -> None:
+        """Register a completed save and rotate only same-root checkpoints."""
+        self.previous_saved_paths = self._destination_owned_previous_paths(
+            self.previous_saved_paths, local_path
+        )
+        self.previous_saved_paths.append(local_path)
+        if (
+            max_ckpt_to_keep
+            and isinstance(max_ckpt_to_keep, int)
+            and max_ckpt_to_keep > 0
+            and len(self.previous_saved_paths) > max_ckpt_to_keep
+        ):
+            remove_count = len(self.previous_saved_paths) - max_ckpt_to_keep
+            to_remove = self.previous_saved_paths[:remove_count]
+            self.remove_previous_save_local_path(to_remove)
+            self.previous_saved_paths = self.previous_saved_paths[remove_count:]
+
     def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
         """
         Save an FSDP checkpoint for this rank.
@@ -157,14 +189,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if local_path is None:
             return
 
-        # record the previous global step
+        # Record the previous global step.  A manager can have been restored
+        # from a checkpoint in another output root (for example a diagnostic
+        # A/C migration).  Such a source is read-only and must never be
+        # considered a rotation candidate for this destination.
         self.previous_global_step = global_step
-
-        # remove previous local_path
-        if max_ckpt_to_keep and isinstance(max_ckpt_to_keep, int) and max_ckpt_to_keep > 0 and len(self.previous_saved_paths) >= max_ckpt_to_keep:
-            keep_start = len(self.previous_saved_paths) - max_ckpt_to_keep + 1
-            self.remove_previous_save_local_path(self.previous_saved_paths[:keep_start])
-            self.previous_saved_paths = self.previous_saved_paths[keep_start:]
 
         local_path = self.local_mkdir(local_path)
         torch.distributed.barrier()
@@ -259,4 +288,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             # wait for rank0 to dump hf_model to local
             torch.distributed.barrier()
 
-        self.previous_saved_paths.append(local_path)
+        # Rotate only after every rank has successfully written the new
+        # checkpoint.  This preserves the last good destination if the new
+        # save fails (OOM, quota, or interrupted job), and the path filter
+        # above guarantees that a checkpoint loaded from another experiment
+        # is never treated as a deletion candidate.
+        self._record_successful_save_and_rotate(local_path, max_ckpt_to_keep)

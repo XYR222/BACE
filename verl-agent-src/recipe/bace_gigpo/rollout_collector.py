@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import os
 import time
 import uuid
@@ -28,6 +30,14 @@ class BaceTrajectoryCollector(TrajectoryCollector):
 
     STATE_VERSION = 1
 
+    def close_branch_pool(self):
+        """Release only a dedicated branch pool; a reused main pool is borrowed."""
+        if not getattr(self, "branch_pool_owns_resources", False):
+            return
+        close = getattr(self.branch_envs, "close", None)
+        if callable(close):
+            close()
+
     def __init__(self, config, tokenizer, processor, branch_envs):
         super().__init__(config=config, tokenizer=tokenizer, processor=processor)
         self.branch_envs = branch_envs
@@ -46,6 +56,49 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         self.branch_execution_mode = str(
             bace_config.get("branch_execution_mode", "legacy_dense")
         )
+        self.branch_pool_mode = str(
+            bace_config.get("branch_pool_mode", "dedicated")
+        )
+        self.branch_pool_owns_resources = self.branch_pool_mode == "dedicated"
+        self.root_active_executor = bool(
+            bace_config.get("root_active_executor", False)
+        )
+        configured_quota_policy = bace_config.get("quota_policy", None)
+        min_natural_roots = int(bace_config.get("min_natural_roots", 2))
+        if configured_quota_policy is None:
+            self.quota_policy = (
+                "current"
+                if min_natural_roots == 2
+                else "conservative_rmin4"
+                if min_natural_roots == 4
+                else f"custom_rmin{min_natural_roots}"
+            )
+        else:
+            self.quota_policy = str(configured_quota_policy)
+        migration_config = bace_config.get("checkpoint_migration", {})
+        self.checkpoint_migration_enabled = bool(
+            migration_config.get("enabled", False)
+        )
+        self.checkpoint_migration_mode = str(
+            migration_config.get("mode", "strict")
+        )
+        if self.checkpoint_migration_mode not in {
+            "strict",
+            "diagnostic_rmin2_to4",
+        }:
+            raise ValueError(
+                "algorithm.bace.checkpoint_migration.mode must be strict or "
+                "diagnostic_rmin2_to4"
+            )
+        if (
+            self.checkpoint_migration_enabled
+            and self.checkpoint_migration_mode != "diagnostic_rmin2_to4"
+        ):
+            raise ValueError(
+                "checkpoint_migration.enabled=true requires "
+                "mode=diagnostic_rmin2_to4"
+            )
+        self.last_checkpoint_migration = None
         self.invalid_action_mode = str(
             bace_config.get("invalid_action_mode", "strict_identity")
         )
@@ -68,6 +121,18 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         if self.branch_execution_mode not in {"legacy_dense", "selected_worker"}:
             raise ValueError(
                 "algorithm.bace.branch_execution_mode must be legacy_dense or selected_worker"
+            )
+        if self.branch_pool_mode not in {"dedicated", "main_reuse"}:
+            raise ValueError(
+                "algorithm.bace.branch_pool_mode must be dedicated or main_reuse"
+            )
+        if (
+            self.branch_pool_mode == "main_reuse"
+            and self.branch_execution_mode != "selected_worker"
+        ):
+            raise ValueError(
+                "algorithm.bace.branch_pool_mode=main_reuse requires "
+                "branch_execution_mode=selected_worker"
             )
         if self.branch_execution_mode == "selected_worker":
             required = (
@@ -202,6 +267,29 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             compare_action_set=bool(config.algorithm.bace.replay.compare_action_set),
         )
         self.max_origin_retries = int(config.algorithm.bace.replay.get("max_origin_retries", 0))
+        self.main_group_size = None
+        if self.branch_pool_mode == "main_reuse":
+            raw_envs = getattr(branch_envs, "envs", None)
+            runtime_group_size = getattr(raw_envs, "group_n", None)
+            if runtime_group_size is None:
+                raise ValueError(
+                    "main_reuse requires the main environment to expose its "
+                    "physical rollout group size"
+                )
+            self.main_group_size = int(runtime_group_size)
+            if self.main_group_size <= 0:
+                raise ValueError("main rollout group size must be positive")
+            configured_group_size = int(config.env.rollout.n)
+            if configured_group_size != self.main_group_size:
+                raise ValueError(
+                    "main environment group size does not match env.rollout.n: "
+                    f"{self.main_group_size} != {configured_group_size}"
+                )
+            if int(bace_config.total_leaf_budget) != self.main_group_size:
+                raise ValueError(
+                    "Current packed Exact main-reuse requires total_leaf_budget "
+                    "to equal the physical main rollout group size"
+                )
         self.last_bace_metrics = {}
         self.current_step = 0
         self.artifact_store = None
@@ -279,10 +367,50 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                     f"BACE collector state mismatch for {name}: "
                     f"checkpoint={state.get(name)!r}, current={expected!r}"
                 )
-        if state.get("parameters") != self.parameter_signature:
-            raise ValueError(
-                "BACE collector parameter signature does not match the checkpoint"
+        saved_parameters = state.get("parameters")
+        if not isinstance(saved_parameters, dict):
+            raise ValueError("BACE collector checkpoint has invalid parameters")
+        if saved_parameters != self.parameter_signature:
+            all_keys = set(saved_parameters) | set(self.parameter_signature)
+            differences = {
+                key: {
+                    "saved": saved_parameters.get(key),
+                    "current": self.parameter_signature.get(key),
+                }
+                for key in sorted(all_keys)
+                if saved_parameters.get(key) != self.parameter_signature.get(key)
+            }
+            allowed = (
+                getattr(self, "checkpoint_migration_enabled", False)
+                and getattr(self, "checkpoint_migration_mode", "strict")
+                == "diagnostic_rmin2_to4"
+                and differences
+                == {
+                    "min_natural_roots": {"saved": 2, "current": 4}
+                }
             )
+            if not allowed:
+                raise ValueError(
+                    "BACE collector parameter signature does not match the checkpoint"
+                )
+            history_state_for_hash = state.get("competence_history")
+            history_payload = json.dumps(
+                history_state_for_hash,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self.last_checkpoint_migration = {
+                "migration_mode": "diagnostic_only",
+                "migration_policy": "diagnostic_rmin2_to4",
+                "allowed_diff": differences,
+                "source_parameter_signature": saved_parameters,
+                "current_parameter_signature": self.parameter_signature,
+                "source_competence_history_sha256": hashlib.sha256(
+                    history_payload
+                ).hexdigest(),
+            }
+        else:
+            self.last_checkpoint_migration = None
         history_state = state.get("competence_history")
         if self.requires_checkpoint_state:
             if history_state is None:
@@ -297,6 +425,24 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         if current_step < 0:
             raise ValueError("BACE collector current_step must be non-negative")
         self.current_step = current_step
+
+    def checkpoint_migration_metadata(
+        self, source_checkpoint: str, source_global_step: int
+    ) -> dict | None:
+        if self.last_checkpoint_migration is None:
+            return None
+        metadata = dict(self.last_checkpoint_migration)
+        metadata.update({
+            "source_checkpoint": os.path.abspath(source_checkpoint),
+            "source_global_step": int(source_global_step),
+            "restored_collector_step": int(self.current_step),
+            "source_competence_history_summary": (
+                self.competence_history.snapshot()
+                if self.competence_history is not None
+                else None
+            ),
+        })
+        return metadata
 
     def _start_artifact_store(self):
         artifact_config = self.config.algorithm.bace.get("artifacts", {})
@@ -333,6 +479,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             "total_leaf_budget": int(self.config.algorithm.bace.total_leaf_budget),
             "max_branches_per_anchor": int(self.config.algorithm.bace.max_branches_per_anchor),
             "min_natural_roots": int(self.config.algorithm.bace.get("min_natural_roots", 2)),
+            "quota_policy": self.quota_policy,
             "batch_erv_threshold": float(self.config.algorithm.bace.get("batch_erv_threshold", 0.0)),
             "batch_erv_tie_abs_tolerance": float(
                 self.config.algorithm.bace.get("batch_erv_tie_abs_tolerance", 1e-12)
@@ -676,6 +823,17 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 for source, stats in source_log_prob_stats.items()
             },
         })
+        branch_occurrences = sum(
+            count
+            for source, count in source_counts.items()
+            if str(source).startswith("branch_")
+        )
+        self.last_bace_metrics.update({
+            "root_trainable_occurrences": int(source_counts.get("root", 0)),
+            "branch_trainable_occurrences": int(branch_occurrences),
+            "root_trainable_tokens": int(token_counts["root"]),
+            "branch_trainable_tokens": int(token_counts["branch"]),
+        })
         artifact_elapsed = float(time.monotonic() - artifact_started)
         self.trace_diagnostics["artifact_write_seconds"] = artifact_elapsed
         self.last_bace_metrics["artifact_write_seconds"] = artifact_elapsed
@@ -687,6 +845,46 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         size = len(batch)
         batch.non_tensor_batch["source_type"] = np.array([source_type] * size, dtype=object)
         batch.non_tensor_batch["leaf_id"] = np.asarray(leaf_ids, dtype=object)
+
+    @staticmethod
+    def _rollout_generation_metrics(batch):
+        """Count newly generated response tokens without counting copied origins."""
+        responses = batch.batch.get("responses")
+        attention_mask = batch.batch.get("attention_mask")
+        if responses is None or attention_mask is None:
+            return {
+                "root_generated_tokens": 0,
+                "branch_generated_tokens": 0,
+                "root_generated_occurrences": 0,
+                "branch_generated_occurrences": 0,
+            }
+        response_length = int(responses.shape[-1])
+        response_attention = attention_mask[:, -response_length:]
+        source_types = np.asarray(
+            batch.non_tensor_batch.get("source_type", ["unknown"] * len(batch)),
+            dtype=object,
+        )
+        result = {
+            "root_generated_tokens": 0,
+            "branch_generated_tokens": 0,
+            "root_generated_occurrences": 0,
+            "branch_generated_occurrences": 0,
+        }
+        for index, source_type in enumerate(source_types):
+            source_type = str(source_type)
+            if source_type == "root":
+                prefix = "root"
+            elif source_type == "branch_suffix":
+                prefix = "branch"
+            else:
+                # branch_origin is copied from a root occurrence, not generated
+                # again during branch execution.
+                continue
+            result[f"{prefix}_generated_tokens"] += int(
+                response_attention[index].sum().item()
+            )
+            result[f"{prefix}_generated_occurrences"] += 1
+        return result
 
     @staticmethod
     def _refresh_success_rate(batch):
@@ -780,6 +978,18 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 )
         return merged
 
+    def _runtime_main_group_size(self, envs):
+        """Return the physical main-pool stride, independent of BACE budget."""
+        fallback = int(self.config.algorithm.bace.total_leaf_budget)
+        raw_envs = getattr(envs, "envs", None)
+        runtime_group_size = getattr(raw_envs, "group_n", None)
+        group_size = (
+            int(runtime_group_size) if runtime_group_size is not None else fallback
+        )
+        if group_size <= 0:
+            raise ValueError("Root environment group size must be positive")
+        return group_size
+
     def _collect_root_wave(
         self,
         gen_batch,
@@ -790,20 +1000,40 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         task_uids,
         reset_keys,
     ):
-        budget = int(self.config.algorithm.bace.total_leaf_budget)
-        worker_indices = [task_idx * budget + slot for task_idx, slot in zip(task_indices, root_slots)]
+        physical_stride = self._runtime_main_group_size(envs)
+        if any(int(slot) < 0 or int(slot) >= physical_stride for slot in root_slots):
+            raise ValueError(
+                "Root slot exceeds the runtime main-environment group size"
+            )
+        worker_indices = [
+            int(task_idx) * physical_stride + int(slot)
+            for task_idx, slot in zip(task_indices, root_slots)
+        ]
         wave_batch = gen_batch.select_idxs(task_indices)
-        rollout = self.vanilla_multi_turn_loop(
-            gen_batch=wave_batch,
-            actor_rollout_wg=actor_rollout_wg,
-            envs=envs,
-            reset_options={
-                "_bace_worker_indices": worker_indices,
-                "_bace_reset_keys": reset_keys,
-            },
-            uid_batch=[task_uids[index] for index in task_indices],
-            task_batch_indices=task_indices,
-        )
+        wave_uids = [task_uids[index] for index in task_indices]
+        if getattr(self, "root_active_executor", False):
+            rollout = self._active_root_multi_turn_loop(
+                gen_batch=wave_batch,
+                actor_rollout_wg=actor_rollout_wg,
+                envs=envs,
+                worker_indices=worker_indices,
+                reset_keys=reset_keys,
+                uid_batch=wave_uids,
+                task_batch_indices=task_indices,
+            )
+        else:
+            self.orchestration_metrics["root_active_executor_enabled"] = 0.0
+            rollout = self.vanilla_multi_turn_loop(
+                gen_batch=wave_batch,
+                actor_rollout_wg=actor_rollout_wg,
+                envs=envs,
+                reset_options={
+                    "_bace_worker_indices": worker_indices,
+                    "_bace_reset_keys": reset_keys,
+                },
+                uid_batch=wave_uids,
+                task_batch_indices=task_indices,
+            )
         total_batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings = rollout
         return self.gather_rollout_data(
             total_batch_list=total_batch_list,
@@ -812,6 +1042,248 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             success=success,
             traj_uid=traj_uid,
             tool_callings=tool_callings,
+        )
+
+    def _active_root_multi_turn_loop(
+        self,
+        gen_batch,
+        actor_rollout_wg,
+        envs,
+        worker_indices,
+        reset_keys,
+        uid_batch,
+        task_batch_indices,
+    ):
+        """Run one packed root wave while submitting only unfinished roots."""
+        required = (
+            "reset_selected",
+            "get_observations_selected",
+            "get_tasks_selected",
+            "step_selected",
+        )
+        missing = [name for name in required if not callable(getattr(envs, name, None))]
+        if missing:
+            raise ValueError(
+                "root_active_executor requires selected-slot environment methods: "
+                + ", ".join(missing)
+            )
+        batch_size = len(gen_batch)
+        if not (
+            len(worker_indices)
+            == len(reset_keys)
+            == len(uid_batch)
+            == len(task_batch_indices)
+            == batch_size
+        ):
+            raise ValueError("Active root logical and physical mappings must match")
+        if len(set(int(slot) for slot in worker_indices)) != batch_size:
+            raise ValueError("Active root worker slots must be unique within a wave")
+
+        envs.reset_selected(worker_indices, reset_keys)
+        task_descriptions = envs.get_tasks_selected(worker_indices)
+        is_done = np.zeros(batch_size, dtype=bool)
+        traj_uid = np.asarray(
+            [str(uuid.uuid4()) for _ in range(batch_size)], dtype=object
+        )
+        uid_batch = np.asarray(uid_batch, dtype=object)
+        task_batch_indices = np.asarray(task_batch_indices, dtype=np.int32)
+        total_batch_list = [[] for _ in range(batch_size)]
+        total_infos = [[] for _ in range(batch_size)]
+        episode_lengths = np.zeros(batch_size, dtype=np.float32)
+        episode_rewards = np.zeros(batch_size, dtype=np.float32)
+        tool_callings = np.zeros(batch_size, dtype=np.float32)
+
+        self.orchestration_metrics["root_active_executor_enabled"] = 1.0
+        self.orchestration_metrics["root_logical_trajectories"] = (
+            self.orchestration_metrics.get("root_logical_trajectories", 0.0)
+            + float(batch_size)
+        )
+        for step_index in range(int(self.config.env.max_steps)):
+            active_indices = np.flatnonzero(~is_done).tolist()
+            if not active_indices:
+                break
+            active_slots = [worker_indices[index] for index in active_indices]
+            observations = envs.get_observations_selected(active_slots)
+            active_batch = gen_batch.select_idxs(active_indices)
+            batch = self.preprocess_batch(active_batch, observations)
+            active_size = len(active_indices)
+            batch.non_tensor_batch["step_index"] = np.full(
+                active_size, step_index, dtype=np.int32
+            )
+            batch.non_tensor_batch["admissible_actions"] = np.asarray(
+                observations.get(
+                    "admissible_actions", [tuple() for _ in range(active_size)]
+                ),
+                dtype=object,
+            )
+            batch_input = batch.pop(
+                batch_keys=["input_ids", "attention_mask", "position_ids"],
+                non_tensor_batch_keys=[
+                    key
+                    for key in (
+                        "raw_prompt_ids",
+                        "multi_modal_data",
+                        "raw_prompt",
+                        "tools_kwargs",
+                    )
+                    if key in batch.non_tensor_batch
+                ],
+            )
+            batch_input.meta_info = active_batch.meta_info
+            padded, pad_size = pad_dataproto_to_divisor(
+                batch_input, actor_rollout_wg.world_size
+            )
+            started = time.monotonic()
+            output = unpad_dataproto(
+                actor_rollout_wg.generate_sequences(padded), pad_size=pad_size
+            )
+            generation_elapsed = time.monotonic() - started
+            batch = batch.union(output)
+            text_actions = self.tokenizer.batch_decode(
+                batch.batch["responses"], skip_special_tokens=True
+            )
+            env_started = time.monotonic()
+            next_obs, rewards, dones, infos = envs.step_selected(
+                active_slots, text_actions
+            )
+            environment_elapsed = time.monotonic() - env_started
+            rewards = np.asarray(rewards).reshape(-1)
+            dones = np.asarray(dones, dtype=bool).reshape(-1)
+
+            logical_indices = np.asarray(active_indices, dtype=np.int32)
+            batch.non_tensor_batch["uid"] = uid_batch[logical_indices]
+            batch.non_tensor_batch["traj_uid"] = traj_uid[logical_indices]
+            batch.non_tensor_batch["occurrence_id"] = np.asarray(
+                [
+                    f"{traj_uid[logical_index]}:{step_index}"
+                    for logical_index in active_indices
+                ],
+                dtype=object,
+            )
+            batch.non_tensor_batch["task_batch_index"] = task_batch_indices[
+                logical_indices
+            ]
+            batch.non_tensor_batch["is_action_valid"] = np.asarray(
+                [info.get("is_action_valid", True) for info in infos], dtype=bool
+            )
+            batch.non_tensor_batch["raw_model_response"] = np.asarray(
+                text_actions, dtype=object
+            )
+            batch.non_tensor_batch["projected_action"] = np.asarray(
+                [info.get("projected_action", "INVALID") for info in infos],
+                dtype=object,
+            )
+            batch.non_tensor_batch["is_action_format_valid"] = np.asarray(
+                [
+                    info.get(
+                        "is_action_format_valid", info.get("is_action_valid", False)
+                    )
+                    for info in infos
+                ],
+                dtype=bool,
+            )
+            batch.non_tensor_batch["is_action_environment_valid"] = np.asarray(
+                [
+                    info.get(
+                        "is_action_environment_valid",
+                        info.get("is_action_valid", False),
+                    )
+                    for info in infos
+                ],
+                dtype=bool,
+            )
+            batch.non_tensor_batch["action_identity"] = np.asarray(
+                [info.get("action_identity") for info in infos], dtype=object
+            )
+            batch.non_tensor_batch["post_action_observation"] = np.asarray(
+                next_obs.get("anchor", [None for _ in range(active_size)]),
+                dtype=object,
+            )
+            batch.non_tensor_batch["environment_reset_key"] = np.asarray(
+                [
+                    info.get("extra.gamefile", info.get("session_idx", ""))
+                    for info in infos
+                ],
+                dtype=object,
+            )
+            batch.non_tensor_batch["task_description"] = np.asarray(
+                [task_descriptions[index] for index in active_indices], dtype=object
+            )
+            batch.non_tensor_batch["done"] = dones
+            batch.non_tensor_batch["remaining_horizon"] = np.full(
+                active_size,
+                int(self.config.env.max_steps) - step_index - 1,
+                dtype=np.int32,
+            )
+            batch.non_tensor_batch["rewards"] = rewards.astype(object)
+            batch.non_tensor_batch["active_masks"] = np.ones(
+                active_size, dtype=object
+            )
+
+            rows = to_list_of_dict(batch)
+            for row_index, logical_index in enumerate(active_indices):
+                total_batch_list[logical_index].append(rows[row_index])
+                total_infos[logical_index].append(infos[row_index])
+                episode_rewards[logical_index] += float(rewards[row_index])
+                episode_lengths[logical_index] += 1
+                if "tool_calling" in infos[row_index]:
+                    tool_callings[logical_index] += float(
+                        infos[row_index]["tool_calling"]
+                    )
+                is_done[logical_index] = bool(dones[row_index])
+
+            submitted_size = active_size + int(pad_size)
+            dense_size = batch_size
+            for key, value in (
+                ("root_generation_turns", 1.0),
+                ("root_active_sequences", float(active_size)),
+                ("root_dense_equivalent_sequences", float(dense_size)),
+                ("root_rows_avoided", float(dense_size - active_size)),
+                ("root_model_rows_submitted", float(submitted_size)),
+                ("root_padding_rows_submitted", float(pad_size)),
+                ("root_environment_steps", float(active_size)),
+                ("root_generate_wallclock", float(generation_elapsed)),
+                ("root_env_wallclock", float(environment_elapsed)),
+            ):
+                self.orchestration_metrics[key] = (
+                    self.orchestration_metrics.get(key, 0.0) + value
+                )
+            if self.artifact_store is not None:
+                self.artifact_store.append("root_active_execution_waves", {
+                    "step_index": step_index,
+                    "logical_batch_size": batch_size,
+                    "active_logical_indices": active_indices,
+                    "active_worker_slots": active_slots,
+                    "active_sequences": active_size,
+                    "dense_equivalent_sequences": dense_size,
+                    "submitted_sequences": submitted_size,
+                    "padding_sequences": int(pad_size),
+                    "generation_seconds": generation_elapsed,
+                    "environment_seconds": environment_elapsed,
+                })
+
+        dense_total = float(
+            self.orchestration_metrics.get("root_dense_equivalent_sequences", 0.0)
+        )
+        active_total = float(
+            self.orchestration_metrics.get("root_active_sequences", 0.0)
+        )
+        self.orchestration_metrics["root_active_efficiency"] = (
+            active_total / dense_total if dense_total else 1.0
+        )
+        success = envs.success_evaluator(
+            total_infos=total_infos,
+            total_batch_list=total_batch_list,
+            episode_rewards=episode_rewards,
+            episode_lengths=episode_lengths,
+        )
+        return (
+            total_batch_list,
+            episode_rewards,
+            episode_lengths,
+            success,
+            traj_uid,
+            tool_callings,
         )
 
     @staticmethod
@@ -850,6 +1322,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         """Generate staged roots in dependency-respecting, accelerator-sized waves."""
         task_count = len(gen_batch)
         budget = int(self.config.algorithm.bace.total_leaf_budget)
+        physical_stride = self._runtime_main_group_size(envs)
         pilot_roots = int(self.config.algorithm.bace.pilot_roots)
         task_indices = list(range(task_count))
         task_uids = [str(uuid.uuid4()) for _ in task_indices]
@@ -859,7 +1332,9 @@ class BaceTrajectoryCollector(TrajectoryCollector):
 
         probe_started = time.monotonic()
         _, probe_infos = envs.reset(kwargs={
-            "_bace_worker_indices": [task_idx * budget for task_idx in task_indices],
+            "_bace_worker_indices": [
+                task_idx * physical_stride for task_idx in task_indices
+            ],
             "_bace_reset_keys": [None] * task_count,
         })
         reset_key_by_task = {
@@ -1049,6 +1524,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         """Generate no-pilot roots from lagged family plans, then correct capacity."""
         task_count = len(gen_batch)
         budget = int(self.config.algorithm.bace.total_leaf_budget)
+        physical_stride = self._runtime_main_group_size(envs)
         task_indices = list(range(task_count))
         task_uids = [str(uuid.uuid4()) for _ in task_indices]
         generated_by_task = {task_idx: 0 for task_idx in task_indices}
@@ -1057,7 +1533,9 @@ class BaceTrajectoryCollector(TrajectoryCollector):
 
         probe_started = time.monotonic()
         _, probe_infos = envs.reset(kwargs={
-            "_bace_worker_indices": [task_idx * budget for task_idx in task_indices],
+            "_bace_worker_indices": [
+                task_idx * physical_stride for task_idx in task_indices
+            ],
             "_bace_reset_keys": [None] * task_count,
         })
         reset_key_by_task = {
@@ -1775,9 +2253,10 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         ):
             self.orchestration_metrics.setdefault(key, value)
         self.orchestration_metrics["branch_selected_worker_execution"] = 1.0
+        worker_slots = self._branch_worker_slots(requests)
         entries = [
             {"slot": slot, "request": request, "result": None}
-            for slot, request in enumerate(requests)
+            for slot, request in zip(worker_slots, requests)
         ]
         if used_origins is None:
             used_origins = set()
@@ -1999,11 +2478,74 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             return self._execute_chunk_selected(*args, **kwargs)
         return self._execute_chunk_legacy(*args, **kwargs)
 
+    def _branch_worker_slots(self, requests):
+        """Map one replay-capacity cohort to unique physical worker slots."""
+        requests = list(requests)
+        if getattr(self, "branch_pool_mode", "dedicated") == "dedicated":
+            return list(range(len(requests)))
+
+        capacity = int(self.branch_envs.replay_capacity)
+        if len(requests) > capacity:
+            raise ValueError("A branch capacity cohort exceeds replay capacity")
+        group_size = int(self.main_group_size)
+        if capacity % group_size:
+            raise ValueError(
+                "Main replay capacity must be divisible by its rollout group size"
+            )
+        task_capacity = capacity // group_size
+        local_counts = {}
+        slots = []
+        for request in requests:
+            task_index = int(request.task_batch_index)
+            if not 0 <= task_index < task_capacity:
+                raise ValueError(
+                    f"Invalid task_batch_index for main replay pool: {task_index}"
+                )
+            local_slot = local_counts.get(task_index, 0)
+            if local_slot >= group_size:
+                raise ValueError(
+                    "A task has more branch requests in one cohort than its "
+                    "physical main-pool group can hold"
+                )
+            slots.append(task_index * group_size + local_slot)
+            local_counts[task_index] = local_slot + 1
+        if len(slots) != len(set(slots)):
+            raise AssertionError("Branch physical slot collision")
+        if slots and (min(slots) < 0 or max(slots) >= capacity):
+            raise AssertionError("Branch physical slot falls outside replay capacity")
+        return slots
+
+    def _branch_capacity_cohorts(self, requests, capacity):
+        """Chunk requests without overbooking any task-local main-pool group."""
+        requests = list(requests)
+        if getattr(self, "branch_pool_mode", "dedicated") == "dedicated":
+            return self._chunk_requests(requests, capacity)
+        if capacity <= 0:
+            raise ValueError("Replay capacity must be positive")
+        group_size = int(self.main_group_size)
+        cohorts = []
+        current = []
+        counts = {}
+        for request in requests:
+            task_index = int(request.task_batch_index)
+            if current and (
+                len(current) >= capacity
+                or counts.get(task_index, 0) >= group_size
+            ):
+                cohorts.append(current)
+                current = []
+                counts = {}
+            current.append(request)
+            counts[task_index] = counts.get(task_index, 0) + 1
+        if current:
+            cohorts.append(current)
+        return cohorts
+
     def _execute_round(self, root_output, gen_batch, actor_rollout_wg, requests):
         """Execute one frozen acquisition round in replay-capacity-sized waves."""
         requests = list(requests)
         capacity = int(self.branch_envs.replay_capacity)
-        chunks = self._chunk_requests(requests, capacity)
+        chunks = self._branch_capacity_cohorts(requests, capacity)
         if not chunks:
             return [], None, None, None
 
@@ -2018,6 +2560,15 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         reward_batches = []
 
         self.orchestration_metrics["branch_replay_capacity"] = float(capacity)
+        self.orchestration_metrics["branch_requests_total"] = float(len(requests))
+        self.orchestration_metrics["branch_capacity_cohorts"] = (
+            self.orchestration_metrics.get("branch_capacity_cohorts", 0.0)
+            + float(len(chunks))
+        )
+        self.orchestration_metrics["branch_main_pool_reuse"] = float(
+            getattr(self, "branch_pool_mode", "dedicated") == "main_reuse"
+        )
+        self.orchestration_metrics["branch_slot_collisions"] = 0.0
         self.orchestration_metrics["branch_execution_waves"] = (
             self.orchestration_metrics.get("branch_execution_waves", 0.0)
             + float(len(chunks))
@@ -2028,11 +2579,17 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         )
 
         for execution_wave, chunk in enumerate(chunks):
+            worker_slots = self._branch_worker_slots(chunk)
             if self.artifact_store is not None:
                 self.artifact_store.append("branch_execution_waves", {
                     "execution_wave": execution_wave,
+                    "capacity_cohort": execution_wave,
                     "request_count": len(chunk),
                     "replay_capacity": capacity,
+                    "branch_pool_mode": getattr(
+                        self, "branch_pool_mode", "dedicated"
+                    ),
+                    "worker_slots": worker_slots,
                     "request_ids": [request.request_id for request in chunk],
                     "branch_ids": [request.branch_id for request in chunk],
                 })
@@ -2310,6 +2867,10 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                     task_id: count for task_id, count in generated_by_task.items()
                 }
             topology_metrics = {
+                "quota_policy_current": float(self.quota_policy == "current"),
+                "quota_policy_conservative_rmin4": float(
+                    self.quota_policy == "conservative_rmin4"
+                ),
                 "root_generation_mode": float(self.dynamic_root_generation == "staged"),
                 "generated_roots_mean": float(np.mean(list(generated_counts.values()))),
                 "discarded_roots_mean": float(
@@ -2319,13 +2880,42 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                     ])
                 ),
                 "planned_branches_mean": float(np.mean([task.planned_branch_count for task in tasks])),
+                "planned_branches_total": float(
+                    sum(task.planned_branch_count for task in tasks)
+                ),
+                "planned_roots_mean": float(
+                    np.mean([
+                        int(self.config.algorithm.bace.total_leaf_budget)
+                        - task.planned_branch_count
+                        for task in tasks
+                    ])
+                ),
                 "final_roots_mean": float(np.mean([task.final_root_count for task in tasks])),
                 "final_branches_mean": float(np.mean([task.final_branch_count for task in tasks])),
+                "final_branches_total": float(
+                    sum(task.final_branch_count for task in tasks)
+                ),
                 "effective_anchors_mean": float(np.mean([task.effective_anchor_count for task in tasks])),
                 "competence_readiness_mean": float(np.mean([task.readiness for task in tasks])),
                 "capacity_corrections_mean": float(
                     np.mean([task.correction_count for task in tasks])
                 ),
+                "corrections_total": float(
+                    sum(task.correction_count for task in tasks)
+                ),
+                "correction_rate_normalized": float(
+                    sum(task.correction_count for task in tasks)
+                    / max(sum(task.planned_branch_count for task in tasks), 1)
+                ),
+                "correction_depth_p50": float(np.percentile(
+                    [task.correction_count for task in tasks], 50
+                )),
+                "correction_depth_p90": float(np.percentile(
+                    [task.correction_count for task in tasks], 90
+                )),
+                "correction_depth_max": float(max(
+                    task.correction_count for task in tasks
+                )),
                 "information_capacity_mean": float(
                     np.mean([
                         task.information_capacity
@@ -2333,6 +2923,41 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                         if task.information_capacity is not None
                     ])
                 ) if any(task.information_capacity is not None for task in tasks) else 0.0,
+                "initial_information_capacity_mean": float(np.mean([
+                    task.initial_information_capacity
+                    for task in tasks
+                    if task.initial_information_capacity is not None
+                ])) if any(
+                    task.initial_information_capacity is not None for task in tasks
+                ) else 0.0,
+                "initial_quota_deficit_mean": float(np.mean([
+                    task.initial_quota_deficit
+                    for task in tasks
+                    if task.initial_quota_deficit is not None
+                ])) if any(
+                    task.initial_quota_deficit is not None for task in tasks
+                ) else 0.0,
+                "normalized_initial_quota_deficit_mean": float(np.mean([
+                    task.initial_normalized_quota_deficit
+                    for task in tasks
+                    if task.initial_normalized_quota_deficit is not None
+                    and task.planned_branch_count > 0
+                ])) if any(
+                    task.initial_normalized_quota_deficit is not None
+                    and task.planned_branch_count > 0
+                    for task in tasks
+                ) else 0.0,
+                "zero_planned_branch_task_fraction": float(np.mean([
+                    task.planned_branch_count == 0 for task in tasks
+                ])),
+                "root_generation_seconds_total": float(
+                    self.orchestration_metrics.get(
+                        "planned_root_generation_seconds", 0.0
+                    )
+                    + self.orchestration_metrics.get(
+                        "capacity_correction_root_generation_seconds", 0.0
+                    )
+                ),
                 "family_prior_mean": float(
                     np.mean([
                         task.family_prior_mean
@@ -2372,6 +2997,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 "replay_validation_seconds": float(replay_seconds),
                 **self._episode_success_metrics(root_output),
                 **topology_metrics,
+                **self._rollout_generation_metrics(root_output),
             }
             return root_output
         concat_started = time.monotonic()
@@ -2390,6 +3016,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             "replay_validation_seconds": float(replay_seconds),
             **self._episode_success_metrics(merged_output),
             **topology_metrics,
+            **self._rollout_generation_metrics(merged_output),
             "training_batch_concat_seconds": self.orchestration_metrics[
                 "training_batch_concat_seconds"
             ],

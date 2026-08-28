@@ -5,6 +5,13 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
+# The upstream 2-GPU GiGPO launcher explicitly requests 240G.  BACE adds
+# branch/replay artifacts and checkpoint state, so use the largest practical
+# value allowed by the cluster's roughly 122G/GPU host-memory cap.  Without an
+# explicit directive Slurm derives only 162.5G from the CPU allocation.
+# Keep one old checkpoint during the write; the external pruner performs the
+# final disk rotation after a complete save.
+#SBATCH --mem=244G
 #SBATCH --gres=gpu:2
 #SBATCH --time=23:30:00
 #SBATCH --chdir=/hpcwork/xsz96350/fu_project/work-BACE/verl-agent-src
@@ -29,7 +36,7 @@ RUN_NAME=${BACE_RUN_NAME:-bace_alfworld_qwen2_5_1_5b_exact_2gpu_reference_seed0}
 INVOCATION_ID=${SLURM_JOB_ID:-local}_2gpu_reference_to_step_${TARGET_STEP:-150}
 TARGET_STEP=${TARGET_STEP:-150}
 SAVE_FREQ=${SAVE_FREQ:-5}
-MAX_CHECKPOINTS=${MAX_CHECKPOINTS:-1}
+MAX_CHECKPOINTS=${MAX_CHECKPOINTS:-2}
 [[ "${RUN_NAME}" =~ ^[A-Za-z0-9_.-]+$ ]]
 [[ "${TARGET_STEP}" =~ ^[0-9]+$ ]] && (( TARGET_STEP >= 1 && TARGET_STEP <= 150 ))
 [[ "${SAVE_FREQ}" =~ ^[0-9]+$ ]] && (( SAVE_FREQ >= 1 ))

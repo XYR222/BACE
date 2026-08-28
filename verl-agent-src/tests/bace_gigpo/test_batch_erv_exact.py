@@ -260,6 +260,9 @@ def test_exact_capacity_correction_is_one_way_and_preserves_budget():
 
     assert planner.correct_capacity(initial, states) == {"task-1"}
     assert (state.root_count, state.branch_count, state.correction_count) == (3, 1, 1)
+    assert state.initial_information_capacity == 0
+    assert state.initial_quota_deficit == 2
+    assert state.initial_normalized_quota_deficit == 1.0
 
     corrected = initial + [root("r3", "go to table")]
     assert planner.correct_capacity(corrected, states) == set()
@@ -267,6 +270,9 @@ def test_exact_capacity_correction_is_one_way_and_preserves_budget():
     task = plan.tasks["task-1"]
     assert task.final_root_count + task.final_branch_count == 4
     assert task.information_capacity >= task.final_branch_count
+    assert task.initial_information_capacity == 0
+    assert task.initial_quota_deficit == 2
+    assert task.initial_normalized_quota_deficit == 1.0
 
 
 def test_exact_coordinator_emits_all_branches_in_one_frozen_batch():

@@ -12,6 +12,7 @@ def make_request(index):
         request_id=f"request-{index}",
         branch_id=f"branch-{index}",
         origin_occurrence_id=f"origin-{index}",
+        task_batch_index=index % 16,
     )
 
 
@@ -148,3 +149,67 @@ def test_exact_round_fails_instead_of_dropping_a_chunk_request():
 def test_chunk_helper_rejects_nonpositive_capacity():
     with pytest.raises(ValueError, match="positive"):
         BaceTrajectoryCollector._chunk_requests([make_request(0)], 0)
+
+
+def make_main_reuse_collector(capacity=128, group_size=8):
+    collector = make_collector(capacity=capacity)
+    collector.branch_pool_mode = "main_reuse"
+    collector.main_group_size = group_size
+    return collector
+
+
+def test_main_reuse_maps_current_maximum_96_requests_to_one_cohort():
+    collector = make_main_reuse_collector()
+    requests = []
+    for task_index in range(16):
+        for local_index in range(6):
+            request = make_request(len(requests))
+            request.task_batch_index = task_index
+            request.branch_id = f"task-{task_index}:branch-{local_index}"
+            requests.append(request)
+
+    cohorts = collector._branch_capacity_cohorts(requests, 128)
+    slots = collector._branch_worker_slots(cohorts[0])
+
+    assert len(cohorts) == 1
+    assert len(slots) == 96
+    assert len(set(slots)) == 96
+    assert slots[:6] == [0, 1, 2, 3, 4, 5]
+    assert slots[-6:] == [120, 121, 122, 123, 124, 125]
+
+
+@pytest.mark.parametrize(("request_count", "expected_sizes"), [
+    (129, [128, 1]),
+    (200, [128, 72]),
+])
+def test_main_reuse_capacity_overflow_has_safe_fallback(
+    request_count, expected_sizes
+):
+    collector = make_main_reuse_collector()
+    requests = [make_request(index) for index in range(request_count)]
+
+    cohorts = collector._branch_capacity_cohorts(requests, 128)
+
+    assert [len(cohort) for cohort in cohorts] == expected_sizes
+    assert [request.request_id for cohort in cohorts for request in cohort] == [
+        request.request_id for request in requests
+    ]
+    for cohort in cohorts:
+        slots = collector._branch_worker_slots(cohort)
+        assert len(slots) == len(set(slots))
+
+
+def test_main_reuse_splits_a_task_that_exceeds_its_physical_group():
+    collector = make_main_reuse_collector()
+    requests = [make_request(index) for index in range(17)]
+    for request in requests:
+        request.task_batch_index = 3
+
+    cohorts = collector._branch_capacity_cohorts(requests, 128)
+
+    assert [len(cohort) for cohort in cohorts] == [8, 8, 1]
+    assert [collector._branch_worker_slots(cohort) for cohort in cohorts] == [
+        list(range(24, 32)),
+        list(range(24, 32)),
+        [24],
+    ]

@@ -260,6 +260,8 @@ algorithm:
     dynamic_root_generation: preallocated  # preallocated | staged
     staged_root_batching: sequential  # sequential | packed | frontier; frontier enables task-local mixed MODEL_READY scheduling
     branch_execution_mode: legacy_dense  # legacy_dense preserves the old executor; selected_worker compacts active Exact branches
+    branch_pool_mode: dedicated  # dedicated preserves the old pool; main_reuse uses the main rollout pool
+    root_active_executor: false  # false preserves dense packed roots; true compacts done roots before generation
     frontier_batch_coalescing:
       enabled: False  # merge only already MODEL_READY jobs; never preallocate extra roots
       max_batch_size: 0  # 0 means dispatch all ready jobs
@@ -270,6 +272,9 @@ algorithm:
     total_leaf_budget: 8
     pilot_roots: 2
     min_natural_roots: 2  # BatchERV Exact only; no pilot phase
+    checkpoint_migration:
+      enabled: false  # diagnostic-only; strict signature matching remains the default
+      mode: strict  # strict | diagnostic_rmin2_to4
     competence_threshold: 0.5
     history_initial_mean: null  # when paired with strength, overrides legacy alpha/beta
     history_initial_strength: null

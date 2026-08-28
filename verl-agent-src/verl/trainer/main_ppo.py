@@ -177,12 +177,27 @@ class TaskRunner:
                 )
             from recipe.bace_gigpo.rollout_collector import BaceTrajectoryCollector
 
-            if (
+            branch_pool_mode = str(
+                bace_config.get("branch_pool_mode", "dedicated")
+            )
+            if branch_pool_mode not in {"dedicated", "main_reuse"}:
+                raise ValueError(
+                    "algorithm.bace.branch_pool_mode must be dedicated or main_reuse"
+                )
+            if branch_pool_mode == "main_reuse" and str(
+                bace_config.get("branch_execution_mode", "legacy_dense")
+            ) != "selected_worker":
+                raise ValueError(
+                    "algorithm.bace.branch_pool_mode=main_reuse requires "
+                    "branch_execution_mode=selected_worker"
+                )
+            if branch_pool_mode == "main_reuse" or (
                 str(bace_config.get("dynamic_root_generation", "preallocated")) == "staged"
                 and str(bace_config.get("staged_root_batching", "sequential")) == "frontier"
             ):
-                # Frontier Replay consumes unused sibling slots from the main
-                # 16 x B pool, so allocating a second branch pool is wasteful.
+                # Main-reuse and frontier replay consume slots from the main
+                # train_batch_size x rollout-group pool. The collector does
+                # not own this pool and must never close it independently.
                 branch_envs = envs
             else:
                 from recipe.bace_gigpo.env_factory import make_branch_env
@@ -220,8 +235,13 @@ class TaskRunner:
             envs=envs,
             val_envs=val_envs,
         )
-        trainer.init_workers()
-        trainer.fit()
+        try:
+            trainer.init_workers()
+            trainer.fit()
+        finally:
+            close_branch_pool = getattr(traj_collector, "close_branch_pool", None)
+            if callable(close_branch_pool):
+                close_branch_pool()
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor):
