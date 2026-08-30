@@ -109,23 +109,30 @@ def validate_step(step_dir: Path, max_recomputed_logprob_diff=None,
     checks["natural_occurrences"] = len(leaf_by_id)
 
     topology_records = streams.get("topology", [])
+    # A pairwise-stopping step can record a provisional plan before it adds
+    # fallback roots, followed by the corrected final plan.  Capacity and
+    # R+Q invariants apply to the final plan for each task, not to a
+    # deliberately superseded provisional proposal.
+    final_topology_tasks = {}
     for topology in topology_records:
         plan = topology.get("plan") or {}
         tasks = plan.get("tasks", {})
-        budget = manifest.get("total_leaf_budget")
-        for task_id, task in tasks.items():
-            roots_count = int(task["final_root_count"])
-            branches_count = int(task["final_branch_count"])
-            if budget is not None and roots_count + branches_count != int(budget):
-                errors.append(f"task {task_id}: R + Q != B")
-            max_per_anchor = manifest.get("max_branches_per_anchor")
-            if max_per_anchor is not None and branches_count > int(
-                task.get("effective_anchor_count", 0)
-            ) * int(max_per_anchor):
-                errors.append(f"task {task_id}: branch count exceeds anchor capacity")
+        final_topology_tasks.update(tasks)
         selected_root_ids = set(topology.get("root_ids", []))
         if not selected_root_ids.issubset(root_ids):
             errors.append("topology references unknown root ids")
+    budget = manifest.get("total_leaf_budget")
+    max_per_anchor = manifest.get("max_branches_per_anchor")
+    for task_id, task in final_topology_tasks.items():
+        roots_count = int(task["final_root_count"])
+        branches_count = int(task["final_branch_count"])
+        if budget is not None and roots_count + branches_count != int(budget):
+            errors.append(f"task {task_id}: R + Q != B")
+        if max_per_anchor is not None and branches_count > int(
+            task.get("effective_anchor_count", 0)
+        ) * int(max_per_anchor):
+            errors.append(f"task {task_id}: branch count exceeds anchor capacity")
+    checks["final_topology_task_count"] = len(final_topology_tasks)
 
     replay = streams.get("replay_attempts", [])
     request_ids = {record["request"]["request_id"] for record in replay}
@@ -260,6 +267,8 @@ def validate_step(step_dir: Path, max_recomputed_logprob_diff=None,
 
     acquisition = streams.get("acquisition_rounds", [])
     support = None
+    posterior_support_sizes = []
+    allow_support_updates = len(acquisition) > 1
     for round_record in acquisition:
         for diagnostic in round_record.get("diagnostics", []):
             global_allocation = diagnostic.get("global_allocation")
@@ -309,11 +318,14 @@ def validate_step(step_dir: Path, max_recomputed_logprob_diff=None,
             for anchor_id, actions in anchors.items()
             for action_id in actions
         }
+        posterior_support_sizes.append(len(current_support))
         if support is None:
             support = current_support
-        elif current_support != support:
+        elif not allow_support_updates and current_support != support:
             errors.append(f"round {round_record.get('round')}: posterior support changed")
     checks["frozen_support_size"] = len(support or ())
+    if allow_support_updates:
+        checks["posterior_support_sizes_by_round"] = posterior_support_sizes
 
     diagnostics = summary.get("diagnostics", {})
     source_stats = diagnostics.get("old_log_prob_by_source", {})

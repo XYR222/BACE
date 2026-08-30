@@ -15,9 +15,11 @@
 | 文件 | 内容与限制 |
 |---|---|
 | `BACE_vs_GiGPO_150step_TensorBoard对比分析_2026-08-27.md` | 单 seed 的 150-step 效果、root/branch 结构和系统成本对比；两组 GPU/并行配置不同，不能单独作因果或严格性能结论 |
+| `BACE_2卡结果与4卡及GiGPO对比_2026-08-29.md` | 2 卡 BACE 已完成 150 step、step150 为 86.72%；记录训练后 trace 尾部失败及与 4 卡/GiGPO 的可比性限制 |
 | `BACE_Exact_BatchERV容量修正与Branch规划偏差详细说明_2026-08-26.md` | 对正式 BACE run 的 capacity correction、planned/final branch 偏差和成本审计 |
 | `BACE_容量修正逐阶段与具体任务原因审计_2026-08-26.md` | 逐阶段、逐任务族解释 capacity correction；适合后续 controller 改进 |
 | `analyze_bace_training_curves.py` | 从 TensorBoard event 和 BACE branch artifacts 导出曲线、CSV 和摘要的只读分析工具；运行需要 `tensorboard`、`pandas`、`numpy`、`matplotlib` |
+| `export_2gpu_bace_tensorboard.py` | 导出 2 卡 BACE TensorBoard scalar 的只读工具；不包含原 event/checkpoint |
 
 上面三份实验报告描述的是已经完成的历史 run，不等于当前 GitHub HEAD 已做同版本复跑。原 artifacts 没有随 GitHub 上传。
 
@@ -42,4 +44,4 @@
 
 ## 不纳入 Git 的内容
 
-`__pycache__/` 和 `*.pyc` 是特定 Python 版本生成的缓存，不能作为源码、结果或可复现证据，因此继续由 `.gitignore` 排除。分析脚本生成的 PNG、CSV、JSON 和 TensorBoard 数据应放在 `experiments/` 或独立结果归档，不应继续堆入本目录。
+`__pycache__/` 和 `*.pyc` 是特定 Python 版本生成的缓存，不能作为源码、结果或可复现证据，因此继续由 `.gitignore` 排除。大型 TensorBoard、checkpoint、parquet 和原始日志不进入 Git。小型、已说明 provenance 的 PNG/CSV/JSON 可放入专门的 `analysis_outputs/`，并由该目录 README 明确它们是离线结果而非在线验收。

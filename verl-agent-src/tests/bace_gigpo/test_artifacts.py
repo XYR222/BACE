@@ -185,6 +185,50 @@ def test_trace_validator_rejects_wrong_global_allocation_quota(tmp_path):
     assert any("uses 1 branches, expected 2" in error for error in result["errors"])
 
 
+def test_trace_validator_accepts_pairwise_posterior_updates_and_final_fallback_plan(tmp_path):
+    step_dir = build_valid_trace(tmp_path)
+
+    # Pairwise stopping first records a provisional plan, then replaces it
+    # after adding fallback roots.  Only the final plan may be checked against
+    # the branch capacity invariant.
+    topology_path = step_dir / "topology.jsonl"
+    provisional = json.loads(topology_path.read_text())
+    provisional["plan"]["tasks"]["task-1"].update({
+        "final_root_count": 0,
+        "final_branch_count": 2,
+    })
+    corrected = json.loads(topology_path.read_text())
+    corrected["phase"] = "pairwise_stopping_final"
+    corrected["record_index"] = 1
+    topology_path.write_text(
+        json.dumps(provisional) + "\n" + json.dumps(corrected) + "\n"
+    )
+
+    acquisition_path = step_dir / "acquisition_rounds.jsonl"
+    first_round = json.loads(acquisition_path.read_text())
+    second_round = json.loads(acquisition_path.read_text())
+    second_round["round"] = 2
+    second_round["record_index"] = 1
+    second_round["diagnostics"] = []
+    second_round["posterior_snapshot"]["task-1"]["anchor-1"]["valid::new"] = {
+        "alpha": 2,
+        "beta": 1,
+    }
+    acquisition_path.write_text(
+        json.dumps(first_round) + "\n" + json.dumps(second_round) + "\n"
+    )
+
+    summary_path = step_dir / "summary.json"
+    summary = json.loads(summary_path.read_text())
+    summary["record_counts"]["topology"] = 2
+    summary["record_counts"]["acquisition_rounds"] = 2
+    summary_path.write_text(json.dumps(summary))
+
+    result = validate_step(step_dir)
+    assert result["ok"], result["errors"]
+    assert result["checks"]["posterior_support_sizes_by_round"] == [2, 3]
+
+
 def test_trace_validator_checks_selected_worker_cost_conservation(tmp_path):
     step_dir = build_valid_trace(tmp_path)
     manifest_path = step_dir / "manifest.json"

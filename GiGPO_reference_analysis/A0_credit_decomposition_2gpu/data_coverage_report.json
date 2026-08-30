@@ -1,0 +1,15 @@
+{
+  "gigpo": {
+    "steps_found": 150,
+    "steps_usable": 150,
+    "missing_fields": [],
+    "token_count_available": true
+  },
+  "bace": {
+    "steps_found": 150,
+    "steps_usable": 150,
+    "missing_fields": [],
+    "token_count_available": true,
+    "corrupted_records": 0
+  }
+}

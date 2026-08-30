@@ -53,7 +53,7 @@ def recommend_keep(root: Path, reserve_bytes: int = 10 * GIB) -> dict:
     }
 
 
-def prune(root: Path, keep: int, dry_run: bool = False) -> dict:
+def prune(root: Path, keep: int, dry_run: bool = False, require_bace_state: bool = True) -> dict:
     if keep < 1 or keep > 2:
         raise ValueError("keep must be 1 or 2")
     root = root.resolve()
@@ -66,11 +66,11 @@ def prune(root: Path, keep: int, dry_run: bool = False) -> dict:
     if latest not in entry_by_step:
         raise FileNotFoundError(f"tracked checkpoint global_step_{latest} is missing")
     latest_path = entry_by_step[latest]
-    required = (
-        latest_path / "actor",
-        latest_path / "data.pt",
-        latest_path / "bace_collector_state.json",
-    )
+    required = [latest_path / "actor", latest_path / "data.pt"]
+    # Pure GiGPO checkpoints intentionally have no BACE collector state.
+    # Keep the historical strict check as the default for BACE runs.
+    if require_bace_state:
+        required.append(latest_path / "bace_collector_state.json")
     missing = [str(path) for path in required if not path.exists()]
     if missing:
         raise FileNotFoundError(f"latest checkpoint is incomplete: {missing}")
@@ -98,6 +98,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--recommend", action="store_true")
+    parser.add_argument("--allow-missing-bace-state", action="store_true")
     parser.add_argument("--reserve-gib", type=int, default=10)
     args = parser.parse_args()
     if args.recommend:
@@ -105,7 +106,8 @@ def main() -> None:
     else:
         if args.keep is None:
             parser.error("--keep is required unless --recommend is used")
-        result = prune(args.checkpoint_root, args.keep, args.dry_run)
+        result = prune(args.checkpoint_root, args.keep, args.dry_run,
+                       require_bace_state=not args.allow_missing_bace_state)
     payload = json.dumps(result, indent=2, sort_keys=True)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

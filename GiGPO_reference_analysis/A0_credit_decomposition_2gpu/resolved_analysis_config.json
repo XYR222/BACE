@@ -1,0 +1,10 @@
+{
+  "gamma": 0.95,
+  "invalid_penalty": 0.1,
+  "epsilon": 1e-08,
+  "gigpo_run": "experiments/gigpo-alfworld-reference/runs/seed_0_v2",
+  "bace_run": "experiments/alfworld-qwen2.5-1.5b-exact/bace_artifacts/bace_alfworld_qwen2_5_1_5b_exact_2gpu_mem244_retry",
+  "bace_source": "per-occurrence emitted macro/local components",
+  "normalization": "sample std (ddof=1), zero for singleton/zero variance groups",
+  "token_weighting": "response_mask count from GiGPO token_data; BACE response_token_count"
+}

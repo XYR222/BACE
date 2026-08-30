@@ -1,0 +1,15 @@
+{
+  "artifact_root": "/rwthfs/rz/cluster/hpcwork/xsz96350/fu_project/work-BACE/experiments/alfworld-qwen2.5-1.5b-exact/bace_artifacts/bace_alfworld_qwen2_5_1_5b_exact_2gpu_mem244_retry",
+  "output_dir": "analysis_outputs/Pairwise_Threshold_Sensitivity",
+  "thresholds": [
+    0.005,
+    0.0075,
+    0.01,
+    0.015
+  ],
+  "max_branches_per_anchor": 2,
+  "pair_size": 2,
+  "seed": 0,
+  "step_min": 1,
+  "step_max": 150
+}

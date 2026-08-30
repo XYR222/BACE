@@ -85,6 +85,12 @@
 **/*.pth
 **/*.parquet
 
+# Local analysis transfer bundles can approach 1 GiB.  Keep the human-readable
+# reports and reproducible scripts, but do not publish redundant archives.
+/GiGPO_reference_analysis/*.tar.gz
+/GiGPO_reference_analysis/bundle_2026-08-29/*
+!/GiGPO_reference_analysis/bundle_2026-08-29/README.md
+
 # Temporary and backup files
 **/tmp/
 **/.tmp/

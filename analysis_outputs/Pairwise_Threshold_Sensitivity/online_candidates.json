@@ -1,0 +1,5 @@
+{
+  "tau_low_star": 0.005,
+  "tau_high_star": 0.0075,
+  "rule": "largest evaluated tau retaining >=97% / >=90% of BERV value"
+}

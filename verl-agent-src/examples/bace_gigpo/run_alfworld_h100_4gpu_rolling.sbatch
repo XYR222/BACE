@@ -18,8 +18,9 @@ source "${SCRIPT_DIR}/h100_job_env.sh"
 
 TARGET_STEP=${TARGET_STEP:-150}
 ACTOR_MICRO_BATCH=${ACTOR_MICRO_BATCH:-16}
-MAX_CHECKPOINTS=${MAX_CHECKPOINTS:-1}
+MAX_CHECKPOINTS=${MAX_CHECKPOINTS:-2}
 SAVE_FREQ=${SAVE_FREQ:-5}
+MILESTONE_CHECKPOINT_STEPS=${MILESTONE_CHECKPOINT_STEPS:-10,75,140}
 [[ "${TARGET_STEP}" =~ ^[0-9]+$ ]] && (( TARGET_STEP >= 1 && TARGET_STEP <= 150 ))
 [[ "${ACTOR_MICRO_BATCH}" =~ ^(32|16|8)$ ]]
 [[ "${MAX_CHECKPOINTS}" =~ ^(1|2)$ ]]
@@ -35,10 +36,12 @@ export TEST_FREQ=5
 export ACTOR_MICRO_BATCH
 export LOGPROB_MICRO_BATCH=${ACTOR_MICRO_BATCH}
 export MAX_CHECKPOINTS
+export MILESTONE_CHECKPOINT_STEPS
 unset CHECKPOINT_DIR BACE_ARTIFACT_DIR ROLLOUT_DATA_DIR TENSORBOARD_DIR
 unset RUN_METADATA_DIR TRACE_VALIDATION_REPORT LOG_FILE
 
 checkpoint_root=${BACE_EXP_ROOT}/checkpoints/${BACE_RUN_NAME}
+export MILESTONE_CHECKPOINT_DIR=${BACE_EXP_ROOT}/preserved_checkpoints/${BACE_RUN_NAME}
 artifact_root=${BACE_EXP_ROOT}/bace_artifacts/${BACE_RUN_NAME}
 metadata_dir=${BACE_EXP_ROOT}/run_metadata/${BACE_RUN_NAME}/${BACE_INVOCATION_ID}
 report_dir=${BACE_EXP_ROOT}/trace_validation/${BACE_RUN_NAME}
@@ -62,7 +65,9 @@ fi
 # Unlike the retained legacy segment launcher, this invocation always targets
 # the final step.  A replacement wall-clock allocation resumes whichever
 # periodic checkpoint was last committed; there are no 20/40/... boundaries.
-bash "${SCRIPT_DIR}/run_alfworld_h100_4gpu.sh"
+bash "${SCRIPT_DIR}/run_alfworld_h100_4gpu.sh" \
+    algorithm.bace.branch_pool_mode=main_reuse \
+    algorithm.bace.root_active_executor=true
 
 if [[ "${DRY_RUN:-0}" == 1 ]]; then
     exit 0

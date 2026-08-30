@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=bace15b_2g_ref
-#SBATCH --partition=c25g
-#SBATCH --account=rwth2089
+#SBATCH --partition=c23g
+#SBATCH --account=rwth2082
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
@@ -32,19 +32,39 @@ TRAIN_FILE=${WORKSPACE_ROOT}/data/text/train.parquet
 VAL_FILE=${WORKSPACE_ROOT}/data/text/test.parquet
 EXP_ROOT=${WORKSPACE_ROOT}/work-BACE/experiments/alfworld-qwen2.5-1.5b-exact
 
-RUN_NAME=${BACE_RUN_NAME:-bace_alfworld_qwen2_5_1_5b_exact_2gpu_reference_seed0}
-INVOCATION_ID=${SLURM_JOB_ID:-local}_2gpu_reference_to_step_${TARGET_STEP:-150}
 TARGET_STEP=${TARGET_STEP:-150}
+SCHEDULING_PROFILE=${BACE_SCHEDULING_PROFILE:-legacy}
+case "${SCHEDULING_PROFILE}" in
+    legacy)
+        BRANCH_POOL_MODE=dedicated
+        ROOT_ACTIVE_EXECUTOR=false
+        ;;
+    optimized)
+        BRANCH_POOL_MODE=main_reuse
+        ROOT_ACTIVE_EXECUTOR=true
+        ;;
+    *)
+        printf 'BACE_SCHEDULING_PROFILE must be legacy or optimized, got: %s\n' \
+            "${SCHEDULING_PROFILE}" >&2
+        exit 2
+        ;;
+esac
+RUN_NAME=${BACE_RUN_NAME:-bace_alfworld_qwen2_5_1_5b_exact_2gpu_reference_seed0}
+INVOCATION_ID=${BACE_INVOCATION_ID:-${SLURM_JOB_ID:-local}_2gpu_${SCHEDULING_PROFILE}_to_step_${TARGET_STEP}}
 SAVE_FREQ=${SAVE_FREQ:-5}
 MAX_CHECKPOINTS=${MAX_CHECKPOINTS:-2}
+MILESTONE_CHECKPOINT_STEPS=${MILESTONE_CHECKPOINT_STEPS:-10,75,100,140}
 [[ "${RUN_NAME}" =~ ^[A-Za-z0-9_.-]+$ ]]
 [[ "${TARGET_STEP}" =~ ^[0-9]+$ ]] && (( TARGET_STEP >= 1 && TARGET_STEP <= 150 ))
 [[ "${SAVE_FREQ}" =~ ^[0-9]+$ ]] && (( SAVE_FREQ >= 1 ))
 [[ "${MAX_CHECKPOINTS}" =~ ^(1|2)$ ]]
+[[ "${MILESTONE_CHECKPOINT_STEPS}" =~ ^[0-9]+(,[0-9]+)*$ ]]
 
 ARTIFACT_DIR=${EXP_ROOT}/bace_artifacts/${RUN_NAME}
 CHECKPOINT_DIR=${EXP_ROOT}/checkpoints/${RUN_NAME}
 ROLLOUT_DATA_DIR=${EXP_ROOT}/rollout_trajectories/${RUN_NAME}
+TENSORBOARD_DIR=${EXP_ROOT}/tensorboard/${RUN_NAME}
+MILESTONE_CHECKPOINT_DIR=${EXP_ROOT}/preserved_checkpoints/${RUN_NAME}
 METADATA_DIR=${EXP_ROOT}/run_metadata/${RUN_NAME}/${INVOCATION_ID}
 REPORT_DIR=${EXP_ROOT}/trace_validation/${RUN_NAME}
 LOG_FILE=${EXP_ROOT}/logs/${RUN_NAME}/${INVOCATION_ID}.log
@@ -79,6 +99,7 @@ export NUMEXPR_MAX_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1
 export RAYON_NUM_THREADS=1
 export MALLOC_ARENA_MAX=2
+export TENSORBOARD_DIR
 unset PYTORCH_CUDA_ALLOC_CONF
 
 for required_path in \
@@ -90,6 +111,7 @@ for required_path in \
 done
 
 mkdir -p "${ARTIFACT_DIR}" "${CHECKPOINT_DIR}" "${ROLLOUT_DATA_DIR}" \
+    "${TENSORBOARD_DIR}" "${MILESTONE_CHECKPOINT_DIR}" \
     "${METADATA_DIR}" "${REPORT_DIR}" "$(dirname "${LOG_FILE}")"
 cd "${REPO_ROOT}"
 
@@ -120,6 +142,8 @@ ppo_command=(
     algorithm.bace.dynamic_root_generation=staged
     algorithm.bace.staged_root_batching=packed
     algorithm.bace.branch_execution_mode=selected_worker
+    algorithm.bace.branch_pool_mode="${BRANCH_POOL_MODE}"
+    algorithm.bace.root_active_executor="${ROOT_ACTIVE_EXECUTOR}"
     algorithm.bace.acquisition=batch_erv_exact
     algorithm.bace.total_leaf_budget=8
     algorithm.bace.min_natural_roots=2
@@ -192,7 +216,7 @@ ppo_command=(
     env.rollout.n=8
     env.resources_per_worker.num_cpus=0.1
     trainer.critic_warmup=0
-    "trainer.logger=['console','wandb']"
+    "trainer.logger=['console','wandb','tensorboard']"
     trainer.project_name=verl_agent_alfworld
     trainer.experiment_name="${RUN_NAME}"
     trainer.device=cuda
@@ -210,6 +234,8 @@ ppo_command=(
     trainer.rollout_data_dir="${ROLLOUT_DATA_DIR}"
     trainer.resume_mode=auto
     trainer.max_actor_ckpt_to_keep="${MAX_CHECKPOINTS}"
+    "trainer.milestone_checkpoint_steps=[${MILESTONE_CHECKPOINT_STEPS}]"
+    trainer.milestone_checkpoint_dir="${MILESTONE_CHECKPOINT_DIR}"
     ray_init.num_cpus=32
 )
 
@@ -220,6 +246,11 @@ printf '\n' >> "${METADATA_DIR}/resolved_command.sh"
 
 {
     printf 'run_name=%q\ninvocation_id=%q\n' "${RUN_NAME}" "${INVOCATION_ID}"
+    printf 'scheduling_profile=%q\nbranch_pool_mode=%q\nroot_active_executor=%q\n' \
+        "${SCHEDULING_PROFILE}" "${BRANCH_POOL_MODE}" "${ROOT_ACTIVE_EXECUTOR}"
+    printf 'tensorboard_dir=%q\n' "${TENSORBOARD_DIR}"
+    printf 'milestone_checkpoint_steps=%q\nmilestone_checkpoint_dir=%q\n' \
+        "${MILESTONE_CHECKPOINT_STEPS}" "${MILESTONE_CHECKPOINT_DIR}"
     printf 'model_path=%q\ntrain_file=%q\nval_file=%q\n' \
         "${MODEL_PATH}" "${TRAIN_FILE}" "${VAL_FILE}"
     printf 'reference_script=%q\n' \

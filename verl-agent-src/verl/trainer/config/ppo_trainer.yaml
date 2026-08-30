@@ -250,6 +250,8 @@ algorithm:
   gigpo:
     step_advantage_w: 1.0
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
+    local_credit_mode: occurrence  # occurrence | action_mean; pure GiGPO only
+    capture_action_metadata: False  # instrumentation needed by A1 action-mean/credit diagnostics
     compute_mean_std_cross_steps: True # True weights physical occurrences; False deduplicates trajectories for group statistics
     enable_similarity: False # whether to use similarity-based anchor state grouping in GiGPO (supported for text-only tasks)
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
@@ -274,7 +276,7 @@ algorithm:
     min_natural_roots: 2  # BatchERV Exact only; no pilot phase
     checkpoint_migration:
       enabled: false  # diagnostic-only; strict signature matching remains the default
-      mode: strict  # strict | diagnostic_rmin2_to4
+      mode: strict  # strict | diagnostic_rmin2_to4 | pairwise_from_full
     competence_threshold: 0.5
     history_initial_mean: null  # when paired with strength, overrides legacy alpha/beta
     history_initial_strength: null
@@ -291,6 +293,9 @@ algorithm:
     batch_erv_threshold: 0.01  # initial main value; sweep on the target task
     batch_erv_tie_abs_tolerance: 1.0e-12
     batch_erv_tie_rel_tolerance: 1.0e-10
+    pairwise:
+      mode: full  # full | fixed | stopping; Exact Batch-ERV only
+      batch_size: 2  # fixed at K=2 in the first Pairwise implementation
     local_prior_strength: 2.0
     local_credit_mode: occurrence  # occurrence | action_mean
     invalid_action_mode: strict_identity  # strict_identity | valid_only_branch | single_invalid_bucket
@@ -333,6 +338,9 @@ trainer:
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
   max_actor_ckpt_to_keep: null
   max_critic_ckpt_to_keep: null
+  # Optional immutable hard-link snapshots, independent of normal retention.
+  milestone_checkpoint_steps: []
+  milestone_checkpoint_dir: null
   # The timeout for ray worker group to wait for the register center to be ready
   ray_wait_register_center_timeout: 300
   device: cuda

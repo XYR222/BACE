@@ -402,6 +402,8 @@ class ExactBatchTopologyPlanner:
         self,
         collected_roots: list[RootEventLog],
         states: dict[str, ExactBatchTaskState],
+        *,
+        allow_capacity_shortfall: bool = False,
     ) -> TopologyPlan:
         roots_by_task: dict[str, list[RootEventLog]] = {}
         for root in collected_roots:
@@ -411,7 +413,10 @@ class ExactBatchTopologyPlanner:
         for task_id, state in states.items():
             roots = roots_by_task.get(task_id, [])
             self._assess_task(roots, state)
-            if state.information_capacity < state.branch_count:
+            if (
+                state.information_capacity < state.branch_count
+                and not allow_capacity_shortfall
+            ):
                 raise AssertionError("Exact topology finalized before capacity converged")
             selected_roots.extend(roots)
             tasks[task_id] = TaskTopology(

@@ -9,7 +9,7 @@ from recipe.bace_gigpo.competence import CompetenceHistory
 from recipe.bace_gigpo.coordinator import ExactBatchErvCoordinator
 from recipe.bace_gigpo.posterior import BetaPosterior
 from recipe.bace_gigpo.topology import ExactBatchTopologyPlanner
-from tests.bace_gigpo.test_anchor_and_replay import root
+from tests.bace_gigpo.test_anchor_and_replay import event, root
 from tests.bace_gigpo.test_invalid_action_identity import (
     invalid_event,
     root_with_event,
@@ -305,6 +305,79 @@ def test_exact_coordinator_emits_all_branches_in_one_frozen_batch():
     assert diagnostic["global_allocation"]["solver"] == "quota_aware_exact_dp"
     assert diagnostic["global_allocation"]["branch_quota"] == 2
     assert "tie_optimal_global_allocations" not in diagnostic
+
+
+def test_pairwise_fixed_replans_two_then_remainder_without_threshold_stopping():
+    roots = []
+    for root_id, first, second, success in (
+        ("r1", "open fridge", "open fridge", True),
+        ("r2", "go to table", "go to table", False),
+        ("r3", "open fridge", "open fridge", True),
+        ("r4", "go to table", "go to table", False),
+    ):
+        item = root(root_id, first)
+        item = replace(item, events=item.events + (
+            event(f"{root_id}:2", 2, {"room": "living"}, second),
+        ))
+        roots.append(won(item) if success else item)
+    coordinator = ExactBatchErvCoordinator(
+        max_branches_per_anchor=2,
+        prior_strength=2.0,
+        threshold=1.0,  # P1 must not clip residual structural slots after root correction.
+        seed=19,
+        pairwise_mode="fixed",
+    )
+    coordinator.initialize(
+        roots,
+        branch_quota_by_task={"task-1": 3},
+        prior_mean_by_task={"task-1": 0.5},
+    )
+    first = coordinator.build_round_requests()
+    assert len(first) == 2
+    assert coordinator.last_round_diagnostics[0]["pairwise_mode"] == "fixed"
+    for request in first:
+        coordinator.update_from_branch(request, success=True)
+    second = coordinator.build_round_requests()
+    assert len(second) == 1
+    coordinator.update_from_branch(second[0], success=False)
+    assert coordinator.build_round_requests() == []
+    assert coordinator.consume_fallback_roots() == {}
+    counts = coordinator.pairwise_final_counts()["task-1"]
+    assert counts == {"executed_branches": 3, "fallback_roots": 0, "planned_branches": 3}
+    assert all(value <= 2 for value in coordinator.posterior_snapshot()["pairwise_state"]["task-1"]["used_by_anchor"].values())
+
+
+def test_pairwise_stopping_executes_single_capacity_then_one_way_fallback():
+    roots = [won(root("r1", "open fridge")), root("r2", "go to table")]
+    coordinator = ExactBatchErvCoordinator(
+        max_branches_per_anchor=2,
+        prior_strength=2.0,
+        threshold=0.0,
+        seed=23,
+        pairwise_mode="stopping",
+    )
+    coordinator.initialize(
+        roots,
+        branch_quota_by_task={"task-1": 3},
+        prior_mean_by_task={"task-1": 0.5},
+    )
+    # Simulate that one root-side slot has already been consumed.  Threshold
+    # capacity is now exactly one, exercising the C=1 branch of P2.
+    anchor_id = next(iter(coordinator._pairwise_states["task-1"]["used_by_anchor"]))
+    coordinator._pairwise_states["task-1"]["used_by_anchor"][anchor_id] = 1
+    first = coordinator.build_round_requests()
+    assert len(first) == 1
+    coordinator.update_from_branch(first[0], success=False)
+    # Exhaust all remaining threshold-positive capacity; P2 must transfer the
+    # remaining slots to roots once and must not reopen branching.
+    for key in coordinator._pairwise_states["task-1"]["used_by_anchor"]:
+        coordinator._pairwise_states["task-1"]["used_by_anchor"][key] = 2
+    assert coordinator.build_round_requests() == []
+    assert coordinator.last_round_diagnostics[0]["status"] == "PAIRWISE_STOPPED_FALLBACK"
+    assert coordinator.consume_fallback_roots() == {"task-1": 2}
+    assert coordinator.build_round_requests() == []
+    counts = coordinator.pairwise_final_counts()["task-1"]
+    assert counts == {"executed_branches": 1, "fallback_roots": 2, "planned_branches": 3}
 
 
 def test_stable_tie_break_is_invariant_to_uuid_lineage():

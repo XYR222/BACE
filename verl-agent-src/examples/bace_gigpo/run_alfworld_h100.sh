@@ -91,6 +91,17 @@ overrides=(
     trainer.max_actor_ckpt_to_keep="${MAX_CHECKPOINTS:-2}"
     trainer.validate_on_last_step=false
 )
+if [[ -n "${MILESTONE_CHECKPOINT_STEPS:-}" ]]; then
+    [[ "${MILESTONE_CHECKPOINT_STEPS}" =~ ^[0-9]+(,[0-9]+)*$ ]] || {
+        echo "MILESTONE_CHECKPOINT_STEPS must be a comma-separated integer list" >&2
+        exit 2
+    }
+    : "${MILESTONE_CHECKPOINT_DIR:?MILESTONE_CHECKPOINT_DIR is required}"
+    overrides+=(
+        "trainer.milestone_checkpoint_steps=[${MILESTONE_CHECKPOINT_STEPS}]"
+        "trainer.milestone_checkpoint_dir=${MILESTONE_CHECKPOINT_DIR}"
+    )
+fi
 if [[ -n "${SEGMENT_END_STEP:-}" ]]; then
     overrides+=(trainer.total_training_steps="${SEGMENT_END_STEP}")
 fi

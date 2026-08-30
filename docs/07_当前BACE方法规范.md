@@ -13,6 +13,7 @@ BACE-GiGPO
   + dynamic topology
   + staged/packed natural roots
   + Exact Batch-ERV
+  + Full frozen acquisition（正式默认）
   + selected-worker branch executor
   + strict action identity
   + occurrence local credit
@@ -26,6 +27,8 @@ root_active_executor=true
 ```
 
 这两个 P1-S 开关只改变 worker/padding 调度，不改变冻结的 R/Q、anchor、Exact allocation 或训练 occurrence 语义。`dedicated/false` 旧路径仍保留作 correctness fallback。
+
+代码也提供 K=2 `Pairwise-Fixed` 和 `Pairwise-Stopping`。它们会在每个全局 branch round 后用真实 outcome 更新 residual posterior；Stopping 还可将缺少 threshold-positive capacity 的剩余预算转换为 one-way packed fallback roots。这两种模式属于消融实现，尚未通过在线效果准入，不能写入当前正式方法定义。
 
 ## 2. 基本对象
 
@@ -235,7 +238,7 @@ local_credit_mode = occurrence
 gamma = 0.95
 ```
 
-`action_mean` local credit 仍保留，但不是当前主线。branch outcome 会进入该 branch 的 reward、advantage 和局部诊断；它不会写入下一 step 的 family competence history。family history 只使用 natural root outcome，避免主动采样的 branch 分布污染能力估计。
+`action_mean` local credit 已可用于 GiGPO/BACE 消融，但不是当前主线。它先对相同 task/anchor/action identity 的 occurrence 聚合，再回填 action-level local advantage。branch outcome 会进入该 branch 的 reward、advantage 和局部诊断；它不会写入下一 step 的 family competence history。family history 只使用 natural root outcome，避免主动采样的 branch 分布污染能力估计。
 
 ## 10. PPO 更新与 checkpoint
 
@@ -264,7 +267,11 @@ tracker 只有在上述状态落盘后才原子更新。非零 step 恢复缺少
 
 FSDP actor 轮转在新保存完整后执行，而且删除候选必须属于当前目标 checkpoint root。从另一个实验目录读取的 resume checkpoint 是只读源，不能因目标 run 的 retention policy 被删除。
 
+指定 `milestone_checkpoint_steps` 时，完整 checkpoint 可通过同文件系统硬链接原子保留。该机制不复制 tensor bytes，但被保留 inode 仍占磁盘；它用于建立只读分叉点，不替代 actor/optimizer/dataloader/BACE state 的一致性校验。
+
 当前只提供一个诊断性签名迁移：`diagnostic_rmin2_to4`。它只允许把 `min_natural_roots` 从 2 改为 4，要求独立目标目录，并记录 migration metadata 与 history digest；它不改变 history 内容，也不是正式主线默认或任意签名兼容机制。
+
+Pairwise 对照另有窄化迁移 `pairwise_from_full`，只允许从已校验 Full checkpoint 分叉到独立 Pairwise 输出；它同样不是忽略任意签名差异的开关。
 
 ## 11. 方法不声称什么
 
@@ -273,3 +280,4 @@ FSDP actor 轮转在新保存完整后执行，而且删除候选必须属于当
 - branch Replay 不等于可移植 StateID snapshot。
 - `frontier` scheduler 不是 Exact Batch-ERV 主线的一部分。
 - YAML 里的兼容默认值不是正式实验参数；每次实验以 resolved command 为准。
+- Pairwise 离线 BERV retention 不等于 validation 提升，Pairwise/action-mean 尚未替代正式 Full/occurrence。

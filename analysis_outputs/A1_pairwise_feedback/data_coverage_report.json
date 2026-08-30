@@ -1,0 +1,15 @@
+{
+  "steps_total": 150,
+  "steps_usable": 121,
+  "tasks_total": 2400,
+  "tasks_q_ge3": 1130,
+  "tasks_usable_realized_audit": 1130,
+  "tasks_usable_model_based": 1130,
+  "corrupted_records": 0,
+  "expected_absent_root_only_streams": 10,
+  "missing_outcomes": 0,
+  "full_batch_value_reproduced": 1130,
+  "full_batch_value_mismatches": 0,
+  "corruption_details": [],
+  "reproduction_mismatch_details": []
+}

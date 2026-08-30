@@ -1,0 +1,33 @@
+{
+  "artifact_root": "/rwthfs/rz/cluster/hpcwork/rwth2089/xsz96350/work-BACE/experiments/alfworld-qwen2.5-1.5b-exact/bace_artifacts/bace_alfworld_qwen2_5_1_5b_exact_2gpu_mem244_retry",
+  "output_dir": "/rwthfs/rz/cluster/hpcwork/xsz96350/fu_project/work-BACE/analysis_outputs/A1_pairwise_feedback",
+  "pair_size": 2,
+  "threshold": 0.005,
+  "max_branches_per_anchor": 2,
+  "phase_bounds": [
+    [
+      "early",
+      1,
+      50
+    ],
+    [
+      "middle",
+      51,
+      100
+    ],
+    [
+      "late",
+      101,
+      150
+    ]
+  ],
+  "seed": 0,
+  "step_min": 1,
+  "step_max": 150,
+  "production_engine": "/rwthfs/rz/cluster/hpcwork/xsz96350/fu_project/work-BACE/verl-agent-src/recipe/bace_gigpo/batch_erv.py",
+  "variants": {
+    "A1.1": "realized first pair from frozen Full Batch request order",
+    "P-Fixed": "fixed Q, frozen root support, structural L_max only",
+    "P-Threshold": "fixed initial Q, stop when remaining threshold capacity < remaining Q"
+  }
+}

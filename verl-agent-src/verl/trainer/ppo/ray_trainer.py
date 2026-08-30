@@ -358,23 +358,67 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.GiGPO:
-        advantages, returns = core_gigpo.compute_gigpo_outcome_advantage(
-            token_level_rewards=data.batch['token_level_rewards'], # for episode group reward computing
-            step_rewards=data.batch['step_rewards'], # for step group reward computing
-            response_mask=data.batch['response_mask'],
-            anchor_obs=data.non_tensor_batch['anchor_obs'],
-            index=data.non_tensor_batch['uid'],
-            traj_index=data.non_tensor_batch['traj_uid'],
+        from recipe.bace_gigpo.advantage import (
+            compute_bace_gigpo_advantage,
+            compute_credit_diagnostics,
+            resolve_action_ids,
+        )
+
+        local_credit_mode = kwargs.get("gigpo_local_credit_mode", "occurrence")
+        raw_action_ids = data.non_tensor_batch.get("action_identity")
+        projected_actions = data.non_tensor_batch.get("projected_action")
+        action_ids = None
+        if raw_action_ids is not None or projected_actions is not None:
+            action_ids = resolve_action_ids(raw_action_ids, projected_actions, len(data))
+        if local_credit_mode == "action_mean" and action_ids is None:
+            raise ValueError(
+                "GiGPO action_mean requires algorithm.gigpo.capture_action_metadata=true"
+            )
+        advantages, returns, components = compute_bace_gigpo_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            step_rewards=data.batch["step_rewards"],
+            response_mask=data.batch["response_mask"],
+            anchor_obs=data.non_tensor_batch["anchor_obs"],
+            task_ids=data.non_tensor_batch["uid"],
+            traj_ids=data.non_tensor_batch["traj_uid"],
+            action_ids=action_ids,
             step_advantage_w=step_advantage_w,
             mode=gigpo_mode,
             enable_similarity=gigpo_enable_similarity,
             similarity_thresh=gigpo_similarity_thresh,
             compute_mean_std_cross_steps=gigpo_compute_mean_std_cross_steps,
-            )
+            local_credit_mode=local_credit_mode,
+        )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+        data.non_tensor_batch["gigpo_macro_advantage"] = components["macro"].detach().cpu().numpy()
+        data.non_tensor_batch["gigpo_local_advantage"] = components["local"].detach().cpu().numpy()
+        if action_ids is not None:
+            data.meta_info["credit_diagnostics"] = compute_credit_diagnostics(
+                step_rewards=data.batch["step_rewards"],
+                response_mask=data.batch["response_mask"],
+                anchor_obs=data.non_tensor_batch["anchor_obs"],
+                task_ids=data.non_tensor_batch["uid"],
+                action_ids=action_ids,
+                macro_scores=components["macro"],
+                selected_local_scores=components["local"],
+                step_advantage_w=step_advantage_w,
+                mode=gigpo_mode,
+                enable_similarity=gigpo_enable_similarity,
+                similarity_thresh=gigpo_similarity_thresh,
+            )
     elif adv_estimator == AdvantageEstimator.BACE_GiGPO:
-        from recipe.bace_gigpo.advantage import compute_bace_gigpo_advantage
+        from recipe.bace_gigpo.advantage import (
+            compute_bace_gigpo_advantage,
+            compute_credit_diagnostics,
+            resolve_action_ids,
+        )
+
+        action_ids = resolve_action_ids(
+            data.non_tensor_batch.get("action_identity"),
+            data.non_tensor_batch.get("projected_action"),
+            len(data),
+        )
 
         advantages, returns, components = compute_bace_gigpo_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
@@ -383,9 +427,7 @@ def compute_advantage(
             anchor_obs=data.non_tensor_batch["anchor_obs"],
             task_ids=data.non_tensor_batch["uid"],
             traj_ids=data.non_tensor_batch["traj_uid"],
-            action_ids=data.non_tensor_batch.get(
-                "action_identity", data.non_tensor_batch.get("projected_action")
-            ),
+            action_ids=action_ids,
             step_advantage_w=step_advantage_w,
             mode=gigpo_mode,
             enable_similarity=gigpo_enable_similarity,
@@ -398,6 +440,20 @@ def compute_advantage(
         data.non_tensor_batch["bace_macro_advantage"] = components["macro"].detach().cpu().numpy()
         data.non_tensor_batch["bace_local_advantage"] = components["local"].detach().cpu().numpy()
         data.non_tensor_batch["bace_occurrence_advantage"] = components["occurrence"].detach().cpu().numpy()
+        data.meta_info["credit_diagnostics"] = compute_credit_diagnostics(
+            step_rewards=data.batch["step_rewards"],
+            response_mask=data.batch["response_mask"],
+            anchor_obs=data.non_tensor_batch["anchor_obs"],
+            task_ids=data.non_tensor_batch["uid"],
+            action_ids=action_ids,
+            macro_scores=components["macro"],
+            selected_local_scores=components["local"],
+            step_advantage_w=step_advantage_w,
+            mode=gigpo_mode,
+            enable_similarity=gigpo_enable_similarity,
+            similarity_thresh=gigpo_similarity_thresh,
+            source_types=data.non_tensor_batch.get("source_type"),
+        )
     else:
         raise NotImplementedError
     return data
@@ -992,6 +1048,24 @@ class RayPPOTrainer:
                 os.fsync(stream.fileno())
             os.replace(temporary_path, collector_state_path)
 
+        # Milestones are independent, immutable hard-link snapshots.  The
+        # active checkpoint directory can therefore keep only its latest N
+        # entries without deleting selected long-term checkpoints.
+        milestone_steps = set(self.config.trainer.get("milestone_checkpoint_steps", []))
+        if self.global_steps in milestone_steps:
+            milestone_root = self.config.trainer.get("milestone_checkpoint_dir", None)
+            if not milestone_root:
+                raise ValueError(
+                    "trainer.milestone_checkpoint_dir is required when "
+                    "trainer.milestone_checkpoint_steps is non-empty"
+                )
+            from verl.utils.checkpoint.milestone import preserve_checkpoint
+
+            manifest = preserve_checkpoint(
+                local_global_step_folder, milestone_root, self.global_steps
+            )
+            print(f"Preserved milestone checkpoint: {manifest}")
+
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
         temporary_tracker = f"{local_latest_checkpointed_iteration}.tmp-{uuid.uuid4().hex}"
@@ -1389,8 +1463,16 @@ class RayPPOTrainer:
                             ),
                             gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
+                            gigpo_local_credit_mode=self.config.algorithm.gigpo.get(
+                                "local_credit_mode", "occurrence"
+                            ),
                             bace_local_credit_mode=self.config.algorithm.bace.local_credit_mode,
                         )
+                        credit_diagnostics = batch.meta_info.pop("credit_diagnostics", None)
+                        if credit_diagnostics:
+                            metrics.update(
+                                {f"credit/{key}": value for key, value in credit_diagnostics.items()}
+                            )
                         if hasattr(self.traj_collector, "save_training_diagnostics"):
                             self.traj_collector.save_training_diagnostics(batch)
                             metrics.update(
@@ -1467,6 +1549,17 @@ class RayPPOTrainer:
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+
+                # The collector records rollout sub-phases, whereas PPO timing
+                # is only known here.  Publish a common BACE wall-clock schema
+                # for Full/P1/P2 comparisons without double-counting rollout.
+                if hasattr(self.traj_collector, "last_bace_metrics"):
+                    step_seconds = float(timing_raw.get("step", 0.0))
+                    generation_seconds = float(timing_raw.get("gen", 0.0))
+                    metrics.update({
+                        "bace/time/ppo": max(0.0, step_seconds - generation_seconds),
+                        "bace/time/step_total": step_seconds,
+                    })
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

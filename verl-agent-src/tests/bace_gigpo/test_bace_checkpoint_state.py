@@ -158,6 +158,8 @@ def bare_collector(
     tie_break_identity_mode="legacy_uuid",
     min_natural_roots=2,
     migration_enabled=False,
+    migration_mode=None,
+    pairwise_mode="full",
 ):
     collector = object.__new__(BaceTrajectoryCollector)
     collector.variant = "batch_erv_exact"
@@ -176,9 +178,16 @@ def bare_collector(
         "batch_erv_threshold": threshold,
         "min_natural_roots": min_natural_roots,
     }
+    collector.pairwise_mode = pairwise_mode
+    collector.pairwise_batch_size = 2
+    if pairwise_mode != "full":
+        collector.parameter_signature.update({
+            "pairwise_mode": pairwise_mode,
+            "pairwise_batch_size": 2,
+        })
     collector.tie_break_identity_mode = tie_break_identity_mode
     collector.checkpoint_migration_enabled = migration_enabled
-    collector.checkpoint_migration_mode = (
+    collector.checkpoint_migration_mode = migration_mode or (
         "diagnostic_rmin2_to4" if migration_enabled else "strict"
     )
     collector.last_checkpoint_migration = None
@@ -257,3 +266,45 @@ def test_diagnostic_checkpoint_migration_allows_only_rmin2_to4():
     )
     with pytest.raises(ValueError, match="parameter signature"):
         reverse.load_state_dict(reverse_payload)
+
+
+@pytest.mark.parametrize("pairwise_mode", ["fixed", "stopping"])
+def test_pairwise_from_full_migration_allows_only_schedule_fork(pairwise_mode):
+    source = bare_collector(tie_break_identity_mode="stable_v1")
+    source.competence_history.update({"heat": [True, False, True]})
+    payload = json.loads(json.dumps(source.state_dict()))
+
+    fork = bare_collector(
+        tie_break_identity_mode="stable_v1",
+        migration_enabled=True,
+        migration_mode="pairwise_from_full",
+        pairwise_mode=pairwise_mode,
+    )
+    fork.load_state_dict(payload)
+    assert fork.current_step == source.current_step
+    assert fork.competence_history.snapshot() == source.competence_history.snapshot()
+    metadata = fork.checkpoint_migration_metadata("/source/global_step_7", 7)
+    assert metadata["migration_mode"] == "controlled_semantic_fork"
+    assert metadata["migration_policy"] == "pairwise_from_full"
+    assert metadata["allowed_diff"] == {
+        "pairwise_batch_size": {"saved": None, "current": 2},
+        "pairwise_mode": {"saved": None, "current": pairwise_mode},
+    }
+
+    changed_threshold = bare_collector(
+        threshold=0.01,
+        tie_break_identity_mode="stable_v1",
+        migration_enabled=True,
+        migration_mode="pairwise_from_full",
+        pairwise_mode=pairwise_mode,
+    )
+    with pytest.raises(ValueError, match="parameter signature"):
+        changed_threshold.load_state_dict(payload)
+
+    reverse = bare_collector(
+        tie_break_identity_mode="stable_v1",
+        migration_enabled=True,
+        migration_mode="pairwise_from_full",
+    )
+    with pytest.raises(ValueError, match="parameter signature"):
+        reverse.load_state_dict(fork.state_dict())

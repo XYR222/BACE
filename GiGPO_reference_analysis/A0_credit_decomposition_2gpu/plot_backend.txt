@@ -1,0 +1,1 @@
+gnuplot fallback was used because matplotlib/seaborn are not installed in the analysis Python environment.

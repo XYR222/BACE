@@ -18,17 +18,20 @@
 ## 可选的实验分析
 
 - [`BACE-results-vanilla/`](../BACE-results-vanilla/README.md)：旧 150-step BACE run 的结果分析、早期输入和辅助工具；其中 [BACE 与 GiGPO 对比分析](../BACE-results-vanilla/BACE_vs_GiGPO_150step_TensorBoard对比分析_2026-08-27.md) 是单 seed 经验报告。
-- [`improve-plan/`](../improve-plan/README.md)：P1-S/P1-A 设计与 2026-08-28 H100 专项结果。先读目录索引中的结果文档，再读设计稿。
-- [`GiGPO_reference_analysis/`](../GiGPO_reference_analysis/README.md)：独立 GiGPO reference run 的数据采集和离线分析规范。
+- [`improve-plan/`](../improve-plan/README.md)：P1-S/P1-A、Pairwise 和 action-mean 的设计与专项结果。先读目录索引中的“已完成/未完成”边界。
+- [`analysis/`](../analysis/README.md) 与 [`analysis_outputs/`](../analysis_outputs/README.md)：Pairwise feedback/threshold 的离线程序和小型审计产物。
+- [`GiGPO_reference_analysis/`](../GiGPO_reference_analysis/README.md)：GiGPO reference、credit decomposition 和 fork 实验材料。
 - [`issues_old/`](../issues_old/README.md)：历史事故和早期差异调查，只用于追溯。
 
 ## 一分钟结论
 
 - 旧主实验已经完成 150 个训练 step，最终 validation success rate 87.50%。
 - 作业的 FAILED 状态来自训练后的 trace validator，而非训练失败；完整解释及重新校验结果在 01 文档。
-- 当前工作树比长跑时的源码更新，并新增 P1-S 调度、诊断 migration 和 checkpoint 隔离修复，二者不能视为完全同一源码版本。
+- 2 卡和 4 卡 BACE 都已有 150-step 结果；它们的硬件/并行条件及 trace 尾部状态不同，不能直接作严格因果比较。
+- 当前工作树比长跑时的源码更新，并新增 Pairwise、action-mean 诊断及里程碑 checkpoint，二者不能视为完全同一源码版本。
 - S3（main pool 复用 + active-root executor）已通过 4×H100 专项门禁，是新实验推荐执行配置；Rmin=4 仍是小样本诊断项，方法默认保持 Rmin=2。
 - 原 Slurm/H100 作业链对换设备没有复用价值；只把它当配置和事故证据。
-- 本次分支的 CPU 基线为 `156 passed`；新设备仍须复现单测、dry-run、一步 smoke 和跨进程恢复，再决定正式运行参数。
+- Pairwise 当前结论是 `HOLD / ABLATION ONLY`：实现和离线分析已完成，在线 C0/C1/C2 smoke 尚未完成。
+- 本次分支的准确 CPU 基线见 01 文档；新设备仍须复现单测、dry-run、一步 smoke 和跨进程恢复，再决定正式运行参数。
 
 所有旧文档均保留，没有删除。读到任何“尚未完成 150 step”“当前阻塞于 step 3”“StateID 已实现”之类说法时，先回到 01 和 06 文档核对。

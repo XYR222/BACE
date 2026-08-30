@@ -60,6 +60,9 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             bace_config.get("branch_pool_mode", "dedicated")
         )
         self.branch_pool_owns_resources = self.branch_pool_mode == "dedicated"
+        pairwise_config = bace_config.get("pairwise", {})
+        self.pairwise_mode = str(pairwise_config.get("mode", "full"))
+        self.pairwise_batch_size = int(pairwise_config.get("batch_size", 2))
         self.root_active_executor = bool(
             bace_config.get("root_active_executor", False)
         )
@@ -85,18 +88,21 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         if self.checkpoint_migration_mode not in {
             "strict",
             "diagnostic_rmin2_to4",
+            "pairwise_from_full",
         }:
             raise ValueError(
                 "algorithm.bace.checkpoint_migration.mode must be strict or "
-                "diagnostic_rmin2_to4"
+                "diagnostic_rmin2_to4 or pairwise_from_full"
             )
         if (
             self.checkpoint_migration_enabled
-            and self.checkpoint_migration_mode != "diagnostic_rmin2_to4"
+            and self.checkpoint_migration_mode not in {
+                "diagnostic_rmin2_to4", "pairwise_from_full"
+            }
         ):
             raise ValueError(
                 "checkpoint_migration.enabled=true requires "
-                "mode=diagnostic_rmin2_to4"
+                "mode=diagnostic_rmin2_to4 or pairwise_from_full"
             )
         self.last_checkpoint_migration = None
         self.invalid_action_mode = str(
@@ -166,6 +172,12 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             raise ValueError(
                 "variant=batch_erv_exact requires acquisition=batch_erv_exact"
             )
+        if self.pairwise_mode not in {"full", "fixed", "stopping"}:
+            raise ValueError("algorithm.bace.pairwise.mode must be full, fixed, or stopping")
+        if self.pairwise_batch_size != 2:
+            raise ValueError("algorithm.bace.pairwise.batch_size currently must equal 2")
+        if self.pairwise_mode != "full" and self.variant != "batch_erv_exact":
+            raise ValueError("Pairwise modes require variant=batch_erv_exact")
         self.competence_history = None
         self.topology_planner = None
         if self.topology == "dynamic":
@@ -257,6 +269,8 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 seed=int(config.env.seed),
                 invalid_action_mode=self.invalid_action_mode,
                 tie_break_identity_mode=self.tie_break_identity_mode,
+                pairwise_mode=self.pairwise_mode,
+                pairwise_batch_size=self.pairwise_batch_size,
             )
         else:
             raise ValueError(f"Unknown BACE acquisition mode: {self.acquisition}")
@@ -324,6 +338,15 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             "replay_compare_action_set": bool(bace_config.replay.compare_action_set),
             "replay_max_origin_retries": self.max_origin_retries,
         }
+        # ``full`` is the historical one-round protocol.  Keep its persisted
+        # signature byte-for-byte compatible with checkpoints produced before
+        # the optional Pairwise feature existed; non-full modes are deliberately
+        # distinct experiment semantics and must never resume each other.
+        if self.pairwise_mode != "full":
+            self.parameter_signature.update({
+                "pairwise_mode": self.pairwise_mode,
+                "pairwise_batch_size": self.pairwise_batch_size,
+            })
         # Preserve byte-for-byte compatibility with checkpoints written before
         # stable_v1 existed.  Stable runs add the field, so cross-mode resume is
         # rejected by the existing strict signature comparison.
@@ -380,7 +403,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 for key in sorted(all_keys)
                 if saved_parameters.get(key) != self.parameter_signature.get(key)
             }
-            allowed = (
+            rmin2_to4_allowed = (
                 getattr(self, "checkpoint_migration_enabled", False)
                 and getattr(self, "checkpoint_migration_mode", "strict")
                 == "diagnostic_rmin2_to4"
@@ -389,6 +412,27 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                     "min_natural_roots": {"saved": 2, "current": 4}
                 }
             )
+            # A continuation from Full Batch to a Pairwise arm intentionally
+            # changes only the acquisition *schedule*.  Model/optimizer/RNG,
+            # topology, prior, threshold, action identity, and competence
+            # history must remain identical.  Historical Full checkpoints
+            # predate the optional pairwise signature fields, so accept only
+            # their absence and exactly the new mode/K=2 declaration.
+            pairwise_from_full_allowed = (
+                getattr(self, "checkpoint_migration_enabled", False)
+                and getattr(self, "checkpoint_migration_mode", "strict")
+                == "pairwise_from_full"
+                and differences
+                == {
+                    "pairwise_batch_size": {"saved": None, "current": 2},
+                    "pairwise_mode": {
+                        "saved": None,
+                        "current": self.pairwise_mode,
+                    },
+                }
+                and self.pairwise_mode in {"fixed", "stopping"}
+            )
+            allowed = rmin2_to4_allowed or pairwise_from_full_allowed
             if not allowed:
                 raise ValueError(
                     "BACE collector parameter signature does not match the checkpoint"
@@ -400,8 +444,12 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 separators=(",", ":"),
             ).encode("utf-8")
             self.last_checkpoint_migration = {
-                "migration_mode": "diagnostic_only",
-                "migration_policy": "diagnostic_rmin2_to4",
+                "migration_mode": (
+                    "diagnostic_only"
+                    if self.checkpoint_migration_mode == "diagnostic_rmin2_to4"
+                    else "controlled_semantic_fork"
+                ),
+                "migration_policy": self.checkpoint_migration_mode,
                 "allowed_diff": differences,
                 "source_parameter_signature": saved_parameters,
                 "current_parameter_signature": self.parameter_signature,
@@ -1522,6 +1570,10 @@ class BaceTrajectoryCollector(TrajectoryCollector):
 
     def _collect_exact_batch_dynamic_roots_packed(self, gen_batch, actor_rollout_wg, envs):
         """Generate no-pilot roots from lagged family plans, then correct capacity."""
+        # Keep this low-level helper usable by the lightweight root-wave tests
+        # and external diagnostics that construct a collector with ``__new__``.
+        # A real collector always sets the field in ``__init__``.
+        pairwise_mode = getattr(self, "pairwise_mode", "full")
         task_count = len(gen_batch)
         budget = int(self.config.algorithm.bace.total_leaf_budget)
         physical_stride = self._runtime_main_group_size(envs)
@@ -1595,31 +1647,52 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             "planned",
         )
 
-        while True:
+        if pairwise_mode == "stopping":
+            # P2 deliberately starts as soon as its initially planned natural
+            # roots are available.  Threshold capacity is checked per pair by
+            # the coordinator; C=0 later becomes one-way packed fallback roots.
             correction_started = time.monotonic()
-            deficient = self.topology_planner.correct_capacity(root_logs, states)
-            self.orchestration_metrics["capacity_planning_seconds"] = (
-                self.orchestration_metrics.get("capacity_planning_seconds", 0.0)
-                + float(time.monotonic() - correction_started)
+            for state in states.values():
+                task_roots = [root for root in root_logs if root.task_id == state.task_id]
+                self.topology_planner._assess_task(task_roots, state)
+            self.orchestration_metrics["capacity_planning_seconds"] = float(
+                time.monotonic() - correction_started
             )
             if self.artifact_store is not None:
                 self.artifact_store.append("capacity_checks", {
                     "policy_update_id": self.current_step,
-                    "deficient_task_ids": sorted(deficient),
+                    "deficient_task_ids": [],
+                    "lazy_pairwise_capacity": True,
                     "tasks": states,
                 })
-            if not deficient:
-                break
-            pairs = sorted(
-                (
-                    uid_to_task_index[task_id],
-                    generated_by_task[uid_to_task_index[task_id]],
-                )
-                for task_id in deficient
+            topology_plan = self.topology_planner.finalize(
+                root_logs, states, allow_capacity_shortfall=True
             )
-            collect(pairs, "capacity_correction")
-
-        topology_plan = self.topology_planner.finalize(root_logs, states)
+        else:
+            while True:
+                correction_started = time.monotonic()
+                deficient = self.topology_planner.correct_capacity(root_logs, states)
+                self.orchestration_metrics["capacity_planning_seconds"] = (
+                    self.orchestration_metrics.get("capacity_planning_seconds", 0.0)
+                    + float(time.monotonic() - correction_started)
+                )
+                if self.artifact_store is not None:
+                    self.artifact_store.append("capacity_checks", {
+                        "policy_update_id": self.current_step,
+                        "deficient_task_ids": sorted(deficient),
+                        "tasks": states,
+                    })
+                if not deficient:
+                    break
+                pairs = sorted(
+                    (
+                        uid_to_task_index[task_id],
+                        generated_by_task[uid_to_task_index[task_id]],
+                    )
+                    for task_id in deficient
+                )
+                collect(pairs, "capacity_correction")
+            topology_plan = self.topology_planner.finalize(root_logs, states)
         if any(generated_by_task[index] > budget for index in task_indices):
             raise AssertionError("Exact root generation exceeded the per-task budget")
         concat_started = time.monotonic()
@@ -1633,7 +1706,53 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         generated_by_uid = {
             task_uids[index]: generated_by_task[index] for index in task_indices
         }
+        if pairwise_mode == "stopping":
+            self._pairwise_root_context = {
+                "task_uids": task_uids,
+                "reset_key_by_task": reset_key_by_task,
+                "generated_by_task": generated_by_task,
+                "uid_to_task_index": uid_to_task_index,
+            }
         return root_output, list(topology_plan.roots), topology_plan, generated_by_uid
+
+    def _collect_pairwise_fallback_roots(
+        self, gen_batch, actor_rollout_wg, envs, fallback_by_task: dict[str, int]
+    ):
+        """Generate P2's one-way fallback roots in one global packed wave."""
+        context = getattr(self, "_pairwise_root_context", None)
+        if context is None:
+            raise RuntimeError("Pairwise fallback roots require lazy root context")
+        pairs = []
+        for task_id in sorted(fallback_by_task):
+            count = int(fallback_by_task[task_id])
+            if count <= 0:
+                continue
+            task_index = context["uid_to_task_index"][task_id]
+            for _ in range(count):
+                slot = context["generated_by_task"][task_index]
+                pairs.append((task_index, slot))
+                context["generated_by_task"][task_index] += 1
+        if not pairs:
+            return None, []
+        budget = int(self.config.algorithm.bace.total_leaf_budget)
+        if any(slot >= budget for _, slot in pairs):
+            raise AssertionError("Pairwise fallback root exceeded the leaf budget")
+        indices = [index for index, _ in pairs]
+        slots = [slot for _, slot in pairs]
+        started = time.monotonic()
+        output = self._collect_root_wave(
+            gen_batch,
+            actor_rollout_wg,
+            envs,
+            indices,
+            slots,
+            context["task_uids"],
+            [context["reset_key_by_task"][index] for index in indices],
+        )
+        self._record_root_wave("fallback", len(pairs), time.monotonic() - started)
+        logs = build_root_event_logs(output)
+        self.orchestration_metrics["fallback_root_count"] = float(len(pairs))
+        return output, logs
 
     def _collect_staged_dynamic_roots(self, gen_batch, actor_rollout_wg, envs):
         if self.variant == "batch_erv_exact":
@@ -2668,6 +2787,8 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         self.trace_diagnostics = {}
         self.replay_retry_metadata = {}
         self.orchestration_metrics = {}
+        self._pairwise_root_context = None
+        rollout_started = time.monotonic()
 
         if (
             is_train
@@ -2715,6 +2836,23 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             pass
         else:
             raise ValueError(f"Unknown BACE topology mode: {self.topology}")
+        # These aliases are intentionally stable across Full/P1/P2 so online
+        # comparisons do not have to know the internal root-wave names.
+        self.orchestration_metrics["time/initial_root"] = float(
+            self.orchestration_metrics.get("planned_root_generation_seconds", 0.0)
+            + self.orchestration_metrics.get("pilot_root_generation_seconds", 0.0)
+        )
+        self.orchestration_metrics["time/capacity_correction"] = float(
+            self.orchestration_metrics.get(
+                "capacity_correction_root_generation_seconds", 0.0
+            )
+        )
+        self.orchestration_metrics["count/root_generation_waves"] = float(
+            self.orchestration_metrics.get("root_generation_waves", 0.0)
+        )
+        self.orchestration_metrics["count/capacity_correction_waves"] = float(
+            self.orchestration_metrics.get("capacity_correction_root_waves", 0.0)
+        )
         self._set_lineage(
             root_output,
             "root",
@@ -2738,7 +2876,12 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 prior_mean_by_task=(topology_plan.posterior_mean_by_task if topology_plan else None),
             )
             while True:
+                acquisition_started = time.monotonic()
                 requests = self.coordinator.build_round_requests()
+                self.orchestration_metrics["time/acquisition_compute"] = (
+                    self.orchestration_metrics.get("time/acquisition_compute", 0.0)
+                    + float(time.monotonic() - acquisition_started)
+                )
                 if not requests:
                     break
                 erv_rounds += 1
@@ -2751,8 +2894,13 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                         "diagnostics": self.coordinator.last_round_diagnostics,
                         "posterior_snapshot": self.coordinator.posterior_snapshot(),
                     })
+                branch_started = time.monotonic()
                 valid, origin_output, suffix_output, terminal_rewards = self._execute_round(
                     root_output, gen_batch, actor_rollout_wg, requests
+                )
+                self.orchestration_metrics["time/branch_generation"] = (
+                    self.orchestration_metrics.get("time/branch_generation", 0.0)
+                    + float(time.monotonic() - branch_started)
                 )
                 if self.variant == "batch_erv_exact" and len(valid) != len(requests):
                     raise RuntimeError(
@@ -2818,6 +2966,85 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                     batches.append(origin_output)
                     if suffix_output is not None:
                         batches.append(suffix_output)
+
+        if (
+            self.variant == "batch_erv_exact"
+            and self.pairwise_mode == "stopping"
+            and topology_plan is not None
+        ):
+            fallback_by_task = self.coordinator.consume_fallback_roots()
+            final_counts = self.coordinator.pairwise_final_counts()
+            fallback_output, fallback_logs = self._collect_pairwise_fallback_roots(
+                gen_batch, actor_rollout_wg, envs, fallback_by_task
+            )
+            if fallback_output is not None:
+                batches.append(fallback_output)
+                root_logs.extend(fallback_logs)
+                self._trace_roots(fallback_logs, selected_ids={root.root_id for root in fallback_logs})
+            final_tasks = {}
+            for task_id, task in topology_plan.tasks.items():
+                counts = final_counts.get(task_id, {
+                    "executed_branches": task.final_branch_count,
+                    "fallback_roots": 0,
+                    "planned_branches": task.planned_branch_count,
+                })
+                final_root_count = task.final_root_count + int(counts["fallback_roots"])
+                final_branch_count = int(counts["executed_branches"])
+                if final_root_count + final_branch_count != int(
+                    self.config.algorithm.bace.total_leaf_budget
+                ):
+                    raise AssertionError("Pairwise stopping violated the leaf budget")
+                final_tasks[task_id] = dataclasses.replace(
+                    task,
+                    final_root_count=final_root_count,
+                    final_branch_count=final_branch_count,
+                    correction_count=task.correction_count + int(counts["fallback_roots"]),
+                )
+            topology_plan = dataclasses.replace(
+                topology_plan, roots=tuple(root_logs), tasks=final_tasks
+            )
+            # Preserve both the pre-branch plan and the actual P2 final leaf
+            # topology in the trace.  Consumers can distinguish this entry by
+            # its explicit phase rather than infer it from root counts.
+            if self.artifact_store is not None:
+                self.artifact_store.append("topology", {
+                    "phase": "pairwise_stopping_final",
+                    "plan": topology_plan,
+                    "root_count": len(root_logs),
+                    "root_ids": [root.root_id for root in root_logs],
+                })
+            context = self._pairwise_root_context
+            generated_by_task = {
+                context["task_uids"][index]: count
+                for index, count in context["generated_by_task"].items()
+            }
+            if self.artifact_store is not None:
+                self.artifact_store.append("pairwise_fallback_roots", {
+                    "policy_update_id": self.current_step,
+                    "mode": "stopping",
+                    "fallback_by_task": fallback_by_task,
+                    "final_counts": final_counts,
+                    "one_way_fallback": True,
+                })
+
+        if self.variant == "batch_erv_exact":
+            self.orchestration_metrics["pairwise_fixed"] = float(
+                self.pairwise_mode == "fixed"
+            )
+            self.orchestration_metrics["pairwise_stopping"] = float(
+                self.pairwise_mode == "stopping"
+            )
+            self.orchestration_metrics["pairwise_branch_rounds"] = float(erv_rounds)
+            self.orchestration_metrics["count/pairwise_branch_rounds"] = float(erv_rounds)
+            self.orchestration_metrics["time/fallback_root"] = float(
+                self.orchestration_metrics.get("fallback_root_generation_seconds", 0.0)
+            )
+            self.orchestration_metrics["count/fallback_root_waves"] = float(
+                self.orchestration_metrics.get("fallback_root_waves", 0.0)
+            )
+            self.orchestration_metrics["time/rollout_total"] = float(
+                time.monotonic() - rollout_started
+            )
 
         global_allocation_diagnostics = [
             diagnostic["global_allocation"]
@@ -2989,6 +3216,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             replay_seconds = sum(
                 self.trace_diagnostics.get("phase_timing_seconds", {}).values()
             )
+            generation_metrics = self._rollout_generation_metrics(root_output)
             self.last_bace_metrics = {
                 "requested": requested,
                 "validated": validated,
@@ -2997,7 +3225,13 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 "replay_validation_seconds": float(replay_seconds),
                 **self._episode_success_metrics(root_output),
                 **topology_metrics,
-                **self._rollout_generation_metrics(root_output),
+                **generation_metrics,
+                "generated_tokens/root": generation_metrics["root_generated_tokens"],
+                "generated_tokens/branch": generation_metrics["branch_generated_tokens"],
+                "generated_tokens/total": (
+                    generation_metrics["root_generated_tokens"]
+                    + generation_metrics["branch_generated_tokens"]
+                ),
             }
             return root_output
         concat_started = time.monotonic()
@@ -3008,6 +3242,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         replay_seconds = sum(
             self.trace_diagnostics.get("phase_timing_seconds", {}).values()
         )
+        generation_metrics = self._rollout_generation_metrics(merged_output)
         self.last_bace_metrics = {
             "requested": requested,
             "validated": validated,
@@ -3016,7 +3251,13 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             "replay_validation_seconds": float(replay_seconds),
             **self._episode_success_metrics(merged_output),
             **topology_metrics,
-            **self._rollout_generation_metrics(merged_output),
+            **generation_metrics,
+            "generated_tokens/root": generation_metrics["root_generated_tokens"],
+            "generated_tokens/branch": generation_metrics["branch_generated_tokens"],
+            "generated_tokens/total": (
+                generation_metrics["root_generated_tokens"]
+                + generation_metrics["branch_generated_tokens"]
+            ),
             "training_batch_concat_seconds": self.orchestration_metrics[
                 "training_batch_concat_seconds"
             ],

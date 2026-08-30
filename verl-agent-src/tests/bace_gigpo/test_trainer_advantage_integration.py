@@ -45,6 +45,71 @@ def test_trainer_bace_branch_matches_gigpo_and_records_components():
     assert "bace_occurrence_advantage" in bace_batch.non_tensor_batch
 
 
+def test_pure_gigpo_action_mean_reuses_bace_math_without_enabling_bace():
+    kwargs = {
+        "step_advantage_w": 1.0,
+        "gigpo_mode": "mean_std_norm",
+        "gigpo_enable_similarity": False,
+        "gigpo_compute_mean_std_cross_steps": True,
+    }
+    occurrence = compute_advantage(
+        _batch(),
+        adv_estimator=AdvantageEstimator.GiGPO,
+        gigpo_local_credit_mode="occurrence",
+        **kwargs,
+    )
+    action_mean = compute_advantage(
+        _batch(),
+        adv_estimator=AdvantageEstimator.GiGPO,
+        gigpo_local_credit_mode="action_mean",
+        **kwargs,
+    )
+
+    assert np.allclose(
+        occurrence.non_tensor_batch["gigpo_macro_advantage"],
+        action_mean.non_tensor_batch["gigpo_macro_advantage"],
+    )
+    assert np.isclose(action_mean.non_tensor_batch["gigpo_local_advantage"][0],
+                      action_mean.non_tensor_batch["gigpo_local_advantage"][2])
+    assert "credit_diagnostics" in action_mean.meta_info
+    assert action_mean.meta_info["credit_diagnostics"][
+        "selected_local_within_action_variance_mean"
+    ] == 0.0
+
+
+def test_pure_gigpo_step_weight_zero_is_identical_between_credit_modes():
+    kwargs = {
+        "step_advantage_w": 0.0,
+        "gigpo_mode": "mean_std_norm",
+        "gigpo_enable_similarity": False,
+        "gigpo_compute_mean_std_cross_steps": True,
+    }
+    occurrence = compute_advantage(
+        _batch(), adv_estimator=AdvantageEstimator.GiGPO,
+        gigpo_local_credit_mode="occurrence", **kwargs
+    )
+    action_mean = compute_advantage(
+        _batch(), adv_estimator=AdvantageEstimator.GiGPO,
+        gigpo_local_credit_mode="action_mean", **kwargs
+    )
+    assert torch.allclose(occurrence.batch["advantages"], action_mean.batch["advantages"])
+
+
+def test_action_mean_uses_projected_fallback_for_format_invalid_rows():
+    batch = _batch()
+    batch.non_tensor_batch["action_identity"] = np.array(
+        [None, "valid::y", None, "valid::y"], dtype=object
+    )
+    result = compute_advantage(
+        batch,
+        adv_estimator=AdvantageEstimator.GiGPO,
+        step_advantage_w=1.0,
+        gigpo_mode="mean_std_norm",
+        gigpo_local_credit_mode="action_mean",
+    )
+    assert "gigpo_local_advantage" in result.non_tensor_batch
+
+
 def test_trainer_bace_macro_reads_invalid_penalty_from_token_rewards():
     batch = DataProto.from_single_dict(
         data={

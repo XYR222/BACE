@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -294,7 +294,15 @@ class ExpectedErvCoordinator:
 
 
 class ExactBatchErvCoordinator:
-    """Freeze support, solve the exact joint plan, then emit one parallel round."""
+    """Exact Batch-ERV acquisition with Full, Pairwise-Fixed, or Stopping modes.
+
+    ``full`` preserves the historical one-round implementation.  ``fixed``
+    freezes the final root support and branch quota, but replans only the next
+    K slots after each completed global round.  ``stopping`` additionally
+    applies the configured threshold at every round: capacity one emits one
+    branch, capacity zero converts the remaining branch slots to one-way
+    fallback roots.  The collector owns physical fallback-root generation.
+    """
 
     def __init__(
         self,
@@ -306,6 +314,8 @@ class ExactBatchErvCoordinator:
         seed: int = 0,
         invalid_action_mode: str = "strict_identity",
         tie_break_identity_mode: str = "legacy_uuid",
+        pairwise_mode: str = "full",
+        pairwise_batch_size: int = 2,
     ):
         self.prior_strength = float(prior_strength)
         self.invalid_action_mode = invalid_action_mode
@@ -314,6 +324,12 @@ class ExactBatchErvCoordinator:
                 "tie_break_identity_mode must be legacy_uuid or stable_v1"
             )
         self.tie_break_identity_mode = tie_break_identity_mode
+        if pairwise_mode not in {"full", "fixed", "stopping"}:
+            raise ValueError("pairwise_mode must be full, fixed, or stopping")
+        if pairwise_batch_size != 2:
+            raise ValueError("Exact Pairwise currently supports pairwise_batch_size=2")
+        self.pairwise_mode = pairwise_mode
+        self.pairwise_batch_size = int(pairwise_batch_size)
         self.engine = ExactBatchErvEngine(
             max_branches_per_anchor=max_branches_per_anchor,
             threshold=threshold,
@@ -327,6 +343,9 @@ class ExactBatchErvCoordinator:
         self._selection_by_request = {}
         self._posterior_by_task = {}
         self._completed_outcomes = {}
+        self._pairwise_states = {}
+        self._fallback_roots_by_task = {}
+        self._consumed_fallback_roots_by_task = {}
         self.last_round_diagnostics = []
 
     def set_policy_update_id(self, policy_update_id: int) -> None:
@@ -395,6 +414,9 @@ class ExactBatchErvCoordinator:
         self._selection_by_request = {}
         self._posterior_by_task = {}
         self._completed_outcomes = {}
+        self._pairwise_states = {}
+        self._fallback_roots_by_task = {}
+        self._consumed_fallback_roots_by_task = {}
         self.last_round_diagnostics = []
         skipped = {}
 
@@ -426,10 +448,22 @@ class ExactBatchErvCoordinator:
                     anchor.anchor_id, posteriors
                 )
             total_capacity = sum(design.capacity for design in designs.values())
-            if total_capacity < quota:
+            if self.pairwise_mode == "full" and total_capacity < quota:
                 raise ValueError(
                     f"Task {task_id} exact capacity {total_capacity} is below frozen quota {quota}"
                 )
+            self._posterior_by_task[task_id] = posteriors_by_anchor
+            if self.pairwise_mode != "full":
+                self._pairwise_states[task_id] = {
+                    "decision_task_key": decision_task_key,
+                    "branch_quota": quota,
+                    "completed": 0,
+                    "used_by_anchor": {anchor_id: 0 for anchor_id in designs},
+                    "stopped": False,
+                }
+                # The first pair is intentionally emitted by build_round_requests
+                # so every physical pair round is globally packed.
+                continue
             global_result = self.engine.global_allocation(
                 designs,
                 quota,
@@ -438,7 +472,6 @@ class ExactBatchErvCoordinator:
                 "global_allocation",
             )
             allocation = global_result.selected_allocation
-            self._posterior_by_task[task_id] = posteriors_by_anchor
             selected_local_plans = {}
             branch_idx = 0
             for anchor_id in sorted(allocation):
@@ -519,7 +552,160 @@ class ExactBatchErvCoordinator:
             })
         return skipped
 
+    def _pairwise_designs(self, task_id: str):
+        """Build residual designs for the current posterior state.
+
+        P1 ignores the threshold after the root-side eager correction, while
+        P2 keeps threshold-positive capacity as its stopping signal.
+        """
+        state = self._pairwise_states[task_id]
+        designs = {}
+        for anchor_id, posteriors in self._posterior_by_task[task_id].items():
+            design = self.engine.design_anchor(anchor_id, posteriors)
+            residual = max(0, self.engine.max_branches_per_anchor - state["used_by_anchor"][anchor_id])
+            capacity = residual if self.pairwise_mode == "fixed" else min(design.capacity, residual)
+            designs[anchor_id] = replace(design, capacity=capacity)
+        return designs
+
+    def _pairwise_diagnostic(self, task_id, designs, *, status, plan=None, capacity=None, note=None):
+        state = self._pairwise_states[task_id]
+        remaining = state["branch_quota"] - state["completed"]
+        payload = {
+            "task_id": task_id,
+            "tie_break_identity_mode": self.tie_break_identity_mode,
+            "decision_task_key": state["decision_task_key"],
+            "pairwise_mode": self.pairwise_mode,
+            "pairwise_batch_size": self.pairwise_batch_size,
+            "branch_quota": state["branch_quota"],
+            "completed_branches": state["completed"],
+            "remaining_quota": remaining,
+            "information_capacity": int(sum(design.capacity for design in designs.values()) if capacity is None else capacity),
+            "residual_slots_by_anchor": dict(state["used_by_anchor"]),
+            "anchors": {
+                anchor_id: {
+                    "posteriors": self._posterior_payload(self._posterior_by_task[task_id][anchor_id]),
+                    "design": self._design_payload(design),
+                }
+                for anchor_id, design in designs.items()
+            },
+            "status": status,
+        }
+        if plan is not None:
+            payload.update(plan)
+        if note is not None:
+            payload["note"] = note
+        return payload
+
+    def _emit_pairwise_plan(self, task_id, designs, quota):
+        state = self._pairwise_states[task_id]
+        decision_key = state["decision_task_key"]
+        round_index = state["completed"] // self.pairwise_batch_size + 1
+        result = self.engine.global_allocation(
+            designs,
+            quota,
+            self.policy_update_id,
+            decision_key,
+            "pairwise",
+            round_index,
+        )
+        anchors_by_id = self.index._anchors
+        selected_local_plans = {}
+        requests = []
+        branch_start = state["completed"]
+        for anchor_id in sorted(result.selected_allocation):
+            size = result.selected_allocation[anchor_id]
+            if size == 0:
+                continue
+            local_ties = designs[anchor_id].optimal_plans_by_size[size]
+            local_plan = self.engine.choose_uniform(
+                local_ties,
+                self.policy_update_id,
+                decision_key,
+                "pairwise",
+                round_index,
+                anchor_id,
+                "local_plan",
+                size,
+            )
+            selected_local_plans[anchor_id] = {
+                "size": size,
+                "actions": local_plan.actions,
+                "value": local_plan.value,
+                "tie_count": len(local_ties),
+            }
+            anchor = anchors_by_id[anchor_id]
+            for local_index, action in enumerate(local_plan.actions):
+                origins = self.index.ordered_origins(anchor.origins_by_action[action])
+                origin = self.engine.choose_uniform(
+                    origins,
+                    self.policy_update_id,
+                    decision_key,
+                    "pairwise",
+                    round_index,
+                    anchor_id,
+                    action,
+                    "origin",
+                    local_index,
+                )
+                request = _make_request(
+                    self.index, task_id, branch_start + len(requests), anchor, action, origin
+                )
+                self._selection_by_request[request.request_id] = (anchor_id, action)
+                requests.append(request)
+                state["used_by_anchor"][anchor_id] += 1
+        if len(requests) != quota:
+            raise AssertionError("Pairwise Exact plan emitted the wrong branch count")
+        return requests, {
+            "global_allocation": {
+                "solver": result.solver,
+                "num_anchors": result.num_anchors,
+                "branch_quota": result.branch_quota,
+                "total_information_capacity": result.total_information_capacity,
+                "reachable_state_count": result.reachable_state_count,
+                "optimal_value": result.optimal_value,
+                "optimal_tie_count": result.optimal_count,
+                "selected_allocation": result.selected_allocation,
+                "solver_wall_time_ms": result.solver_wall_time_ms,
+            },
+            "global_optimal_value": result.optimal_value,
+            "global_tie_count": result.optimal_count,
+            "selected_allocation": result.selected_allocation,
+            "selected_local_plans": selected_local_plans,
+            "round_branch_quota": quota,
+        }
+
     def build_round_requests(self) -> list[ReplayRequest]:
+        if self.pairwise_mode != "full":
+            if self._pending_requests:
+                raise RuntimeError("Pairwise requests must be completed before replanning")
+            self.last_round_diagnostics = []
+            requests = []
+            for task_id in self.index.ordered_task_ids():
+                state = self._pairwise_states.get(task_id)
+                if state is None or state["stopped"]:
+                    continue
+                remaining = state["branch_quota"] - state["completed"]
+                if remaining <= 0:
+                    continue
+                designs = self._pairwise_designs(task_id)
+                capacity = sum(design.capacity for design in designs.values())
+                if self.pairwise_mode == "stopping" and capacity == 0:
+                    self._fallback_roots_by_task[task_id] = remaining
+                    state["stopped"] = True
+                    self.last_round_diagnostics.append(self._pairwise_diagnostic(
+                        task_id, designs, status="PAIRWISE_STOPPED_FALLBACK",
+                        capacity=capacity, note="threshold_positive_capacity_zero",
+                    ))
+                    continue
+                quota = min(self.pairwise_batch_size, remaining, capacity)
+                if quota <= 0:
+                    raise AssertionError("Pairwise-Fixed must retain structural residual capacity")
+                emitted, plan = self._emit_pairwise_plan(task_id, designs, quota)
+                requests.extend(emitted)
+                self.last_round_diagnostics.append(self._pairwise_diagnostic(
+                    task_id, designs, status="PAIRWISE_PLANNED", plan=plan, capacity=capacity,
+                ))
+            self._pending_requests = requests
         requests = self._pending_requests
         self._pending_requests = []
         return requests
@@ -531,6 +717,8 @@ class ExactBatchErvCoordinator:
         anchor_id, action = selection
         posterior = self._posterior_by_task[request.task_id][anchor_id][action]
         posterior.update_branch(success)
+        if self.pairwise_mode != "full":
+            self._pairwise_states[request.task_id]["completed"] += 1
         self._completed_outcomes[request.branch_id] = {
             "task_id": request.task_id,
             "anchor_id": anchor_id,
@@ -554,4 +742,37 @@ class ExactBatchErvCoordinator:
                 for task_id, anchors in self._posterior_by_task.items()
             },
             "completed_branch_outcomes": self._completed_outcomes,
+            "pairwise_state": {
+                task_id: {
+                    "branch_quota": state["branch_quota"],
+                    "completed": state["completed"],
+                    "used_by_anchor": dict(state["used_by_anchor"]),
+                    "stopped": state["stopped"],
+                    "fallback_roots": self._fallback_roots_by_task.get(task_id, 0),
+                }
+                for task_id, state in self._pairwise_states.items()
+            },
+        }
+
+    def consume_fallback_roots(self) -> dict[str, int]:
+        """Return one-way P2 fallback slots after all branch rounds finish."""
+        if self._pending_requests or self._selection_by_request:
+            raise RuntimeError("Cannot consume Pairwise fallback before branch completion")
+        result = dict(self._fallback_roots_by_task)
+        self._consumed_fallback_roots_by_task = dict(result)
+        self._fallback_roots_by_task = {}
+        return result
+
+    def pairwise_final_counts(self) -> dict[str, dict[str, int]]:
+        return {
+            task_id: {
+                "executed_branches": int(state["completed"]),
+                "fallback_roots": int(
+                    self._fallback_roots_by_task.get(
+                        task_id, self._consumed_fallback_roots_by_task.get(task_id, 0)
+                    )
+                ),
+                "planned_branches": int(state["branch_quota"]),
+            }
+            for task_id, state in self._pairwise_states.items()
         }

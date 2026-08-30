@@ -6,7 +6,7 @@ FORMAL_ROOT=/hpcwork/xsz96350/fu_project/work-BACE/experiments/alfworld-qwen2.5-
 FORMAL_SCRIPT=${SCRIPT_DIR}/run_alfworld_h100_4gpu_rolling.sbatch
 target_step=${TARGET_STEP:-150}
 micro_batch=${ACTOR_MICRO_BATCH:-16}
-max_checkpoints=${MAX_CHECKPOINTS:-1}
+max_checkpoints=${MAX_CHECKPOINTS:-2}
 dependency_job=
 run_name=${BACE_RUN_NAME:-bace_alfworld_qwen2_5_1_5b_exact_main_seed0}
 partition=${BACE_FORMAL_PARTITION:-c25g}
@@ -40,6 +40,9 @@ primary_args=(--parsable --partition="${partition}" --account="${account}")
 if [[ -n "${dependency_job}" ]]; then
     primary_args+=(--dependency="afterok:${dependency_job}")
 fi
+# Do not put the comma-separated milestone list in --export: Slurm uses
+# commas as variable delimiters.  The rolling job supplies its validated
+# default (10,75,140) internally.
 export_spec="ALL,TARGET_STEP=${target_step},ACTOR_MICRO_BATCH=${micro_batch},MAX_CHECKPOINTS=${max_checkpoints},SAVE_FREQ=5,BACE_RUN_NAME=${run_name}"
 primary_job_id=$(sbatch "${primary_args[@]}" --export="${export_spec}" "${FORMAL_SCRIPT}")
 recovery_job_id=$(sbatch --parsable --partition="${partition}" --account="${account}" \
@@ -48,11 +51,11 @@ recovery_job_id=$(sbatch --parsable --partition="${partition}" --account="${acco
 
 manifest=${FORMAL_ROOT}/chain/rolling_4gpu_${primary_job_id}.tsv
 {
-    printf 'role\tjob_id\tdependency\trun_name\tpartition\taccount\ttarget_step\tmicro_batch\tmax_checkpoints\tsave_freq\n'
-    printf 'primary\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t5\n' \
+    printf 'role\tjob_id\tdependency\trun_name\tpartition\taccount\ttarget_step\tmicro_batch\tmax_checkpoints\tsave_freq\tmilestone_steps\n'
+    printf 'primary\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t5\t10,75,140\n' \
         "${primary_job_id}" "${dependency_job:-none}" "${run_name}" \
         "${partition}" "${account}" "${target_step}" "${micro_batch}" "${max_checkpoints}"
-    printf 'recovery\t%s\tafternotok:%s\t%s\t%s\t%s\t%s\t%s\t%s\t5\n' \
+    printf 'recovery\t%s\tafternotok:%s\t%s\t%s\t%s\t%s\t%s\t%s\t5\t10,75,140\n' \
         "${recovery_job_id}" "${primary_job_id}" "${run_name}" \
         "${partition}" "${account}" "${target_step}" "${micro_batch}" "${max_checkpoints}"
 } > "${manifest}"

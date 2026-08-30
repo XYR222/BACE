@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420">
+<rect width="100%" height="100%" fill="white"/>
+<text x="75" y="28" font-family="sans-serif" font-size="18" font-weight="bold">Weak branch-slot ratio</text>
+<line x1="75" y1="45" x2="75" y2="355" stroke="#333"/>
+<line x1="75" y1="355" x2="730" y2="355" stroke="#333"/>
+<text x="10" y="210.0" font-family="sans-serif" font-size="12" transform="rotate(-90 10 210.0)">Weak branch-slot ratio</text>
+<text x="380.0" y="412" text-anchor="middle" font-family="sans-serif" font-size="12">tau_BERV</text>
+<polyline fill="none" stroke="#1769aa" stroke-width="2.5" points="75.00,333.62 238.75,231.07 402.50,179.44 730.00,66.38"/><circle cx="75.00" cy="333.62" r="4" fill="#1769aa" /><circle cx="238.75" cy="231.07" r="4" fill="#1769aa" /><circle cx="402.50" cy="179.44" r="4" fill="#1769aa" /><circle cx="730.00" cy="66.38" r="4" fill="#1769aa" /><text x="75.00" y="385" text-anchor="middle" font-size="12">0.005</text><text x="238.75" y="385" text-anchor="middle" font-size="12">0.0075</text><text x="402.50" y="385" text-anchor="middle" font-size="12">0.01</text><text x="730.00" y="385" text-anchor="middle" font-size="12">0.015</text>
+<text x="75" y="373" font-family="sans-serif" font-size="11">-0.048062</text>
+<text x="75" y="58" font-family="sans-serif" font-size="11">0.64883</text>
+</svg>

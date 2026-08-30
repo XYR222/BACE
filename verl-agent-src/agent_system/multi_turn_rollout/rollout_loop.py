@@ -42,7 +42,10 @@ class TrajectoryCollector:
 
     def _capture_bace_metadata(self) -> bool:
         bace_config = self.config.algorithm.get("bace", None)
-        return bool(bace_config and bace_config.get("enabled", False))
+        if bace_config and bace_config.get("enabled", False):
+            return True
+        gigpo_config = self.config.algorithm.get("gigpo", None)
+        return bool(gigpo_config and gigpo_config.get("capture_action_metadata", False))
 
     def preprocess_single_sample(
         self,
