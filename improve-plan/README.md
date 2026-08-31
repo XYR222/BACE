@@ -17,6 +17,9 @@
 4. [`BACE_Pairwise_Threshold_Sensitivity_Step1-Step4_实施结果_2026-08-30.md`](BACE_Pairwise_Threshold_Sensitivity_Step1-Step4_实施结果_2026-08-30.md)
    - 完成 Pairwise fixed/stopping 实现和 CPU 专项，离线推荐首测 threshold 0.005；
    - 当前结论为 HOLD / ABLATION ONLY，2–5 step H100 在线 smoke 尚未完成。
+5. [`BACE_优化调度版_2卡与4卡启动说明_2026-08-31.md`](BACE_优化调度版_2卡与4卡启动说明_2026-08-31.md)
+   - 当前 P1-S `main_reuse + active-root` 的 2/4 卡正式入口、seed 和 checkpoint 策略；
+   - 文中的 job ID 截至 2026-08-31 仍是排队状态，不是完成证据。
 
 ## 当前在线验证方案（未完成）
 

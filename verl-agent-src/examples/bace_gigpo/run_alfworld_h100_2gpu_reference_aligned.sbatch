@@ -51,14 +51,21 @@ case "${SCHEDULING_PROFILE}" in
 esac
 RUN_NAME=${BACE_RUN_NAME:-bace_alfworld_qwen2_5_1_5b_exact_2gpu_reference_seed0}
 INVOCATION_ID=${BACE_INVOCATION_ID:-${SLURM_JOB_ID:-local}_2gpu_${SCHEDULING_PROFILE}_to_step_${TARGET_STEP}}
+SEED=${BACE_SEED:-0}
 SAVE_FREQ=${SAVE_FREQ:-5}
 MAX_CHECKPOINTS=${MAX_CHECKPOINTS:-2}
 MILESTONE_CHECKPOINT_STEPS=${MILESTONE_CHECKPOINT_STEPS:-10,75,100,140}
 [[ "${RUN_NAME}" =~ ^[A-Za-z0-9_.-]+$ ]]
 [[ "${TARGET_STEP}" =~ ^[0-9]+$ ]] && (( TARGET_STEP >= 1 && TARGET_STEP <= 150 ))
+[[ "${SEED}" =~ ^[0-9]+$ ]]
 [[ "${SAVE_FREQ}" =~ ^[0-9]+$ ]] && (( SAVE_FREQ >= 1 ))
 [[ "${MAX_CHECKPOINTS}" =~ ^(1|2)$ ]]
-[[ "${MILESTONE_CHECKPOINT_STEPS}" =~ ^[0-9]+(,[0-9]+)*$ ]]
+if [[ "${MILESTONE_CHECKPOINT_STEPS}" == "none" ]]; then
+    MILESTONE_CHECKPOINT_ENABLED=false
+else
+    MILESTONE_CHECKPOINT_ENABLED=true
+    [[ "${MILESTONE_CHECKPOINT_STEPS}" =~ ^[0-9]+(,[0-9]+)*$ ]]
+fi
 
 ARTIFACT_DIR=${EXP_ROOT}/bace_artifacts/${RUN_NAME}
 CHECKPOINT_DIR=${EXP_ROOT}/checkpoints/${RUN_NAME}
@@ -111,8 +118,11 @@ for required_path in \
 done
 
 mkdir -p "${ARTIFACT_DIR}" "${CHECKPOINT_DIR}" "${ROLLOUT_DATA_DIR}" \
-    "${TENSORBOARD_DIR}" "${MILESTONE_CHECKPOINT_DIR}" \
-    "${METADATA_DIR}" "${REPORT_DIR}" "$(dirname "${LOG_FILE}")"
+    "${TENSORBOARD_DIR}" "${METADATA_DIR}" "${REPORT_DIR}" \
+    "$(dirname "${LOG_FILE}")"
+if [[ "${MILESTONE_CHECKPOINT_ENABLED}" == true ]]; then
+    mkdir -p "${MILESTONE_CHECKPOINT_DIR}"
+fi
 cd "${REPO_ROOT}"
 
 # Recognize and rotate checkpoints left by a previous Slurm process before the
@@ -211,7 +221,7 @@ ppo_command=(
     algorithm.gigpo.step_advantage_w=1.0
     algorithm.gigpo.mode=mean_std_norm
     env.env_name=alfworld/AlfredTWEnv
-    env.seed=0
+    env.seed="${SEED}"
     env.max_steps=50
     env.rollout.n=8
     env.resources_per_worker.num_cpus=0.1
@@ -234,10 +244,15 @@ ppo_command=(
     trainer.rollout_data_dir="${ROLLOUT_DATA_DIR}"
     trainer.resume_mode=auto
     trainer.max_actor_ckpt_to_keep="${MAX_CHECKPOINTS}"
-    "trainer.milestone_checkpoint_steps=[${MILESTONE_CHECKPOINT_STEPS}]"
-    trainer.milestone_checkpoint_dir="${MILESTONE_CHECKPOINT_DIR}"
     ray_init.num_cpus=32
 )
+
+if [[ "${MILESTONE_CHECKPOINT_ENABLED}" == true ]]; then
+    ppo_command+=(
+        "trainer.milestone_checkpoint_steps=[${MILESTONE_CHECKPOINT_STEPS}]"
+        trainer.milestone_checkpoint_dir="${MILESTONE_CHECKPOINT_DIR}"
+    )
+fi
 
 # Optional Hydra overrides are appended last for a bounded smoke/debug run.
 ppo_command+=("$@")
@@ -245,7 +260,8 @@ printf '%q ' "${ppo_command[@]}" > "${METADATA_DIR}/resolved_command.sh"
 printf '\n' >> "${METADATA_DIR}/resolved_command.sh"
 
 {
-    printf 'run_name=%q\ninvocation_id=%q\n' "${RUN_NAME}" "${INVOCATION_ID}"
+    printf 'run_name=%q\ninvocation_id=%q\nseed=%q\n' \
+        "${RUN_NAME}" "${INVOCATION_ID}" "${SEED}"
     printf 'scheduling_profile=%q\nbranch_pool_mode=%q\nroot_active_executor=%q\n' \
         "${SCHEDULING_PROFILE}" "${BRANCH_POOL_MODE}" "${ROOT_ACTIVE_EXECUTOR}"
     printf 'tensorboard_dir=%q\n' "${TENSORBOARD_DIR}"

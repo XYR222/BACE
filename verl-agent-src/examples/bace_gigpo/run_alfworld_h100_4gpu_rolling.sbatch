@@ -21,10 +21,18 @@ ACTOR_MICRO_BATCH=${ACTOR_MICRO_BATCH:-16}
 MAX_CHECKPOINTS=${MAX_CHECKPOINTS:-2}
 SAVE_FREQ=${SAVE_FREQ:-5}
 MILESTONE_CHECKPOINT_STEPS=${MILESTONE_CHECKPOINT_STEPS:-10,75,140}
+BACE_SEED=${BACE_SEED:-0}
 [[ "${TARGET_STEP}" =~ ^[0-9]+$ ]] && (( TARGET_STEP >= 1 && TARGET_STEP <= 150 ))
 [[ "${ACTOR_MICRO_BATCH}" =~ ^(32|16|8)$ ]]
 [[ "${MAX_CHECKPOINTS}" =~ ^(1|2)$ ]]
 [[ "${SAVE_FREQ}" =~ ^[0-9]+$ ]] && (( SAVE_FREQ >= 1 ))
+[[ "${BACE_SEED}" =~ ^[0-9]+$ ]]
+if [[ "${MILESTONE_CHECKPOINT_STEPS}" == "none" ]]; then
+    MILESTONE_CHECKPOINT_ENABLED=false
+else
+    MILESTONE_CHECKPOINT_ENABLED=true
+    [[ "${MILESTONE_CHECKPOINT_STEPS}" =~ ^[0-9]+(,[0-9]+)*$ ]]
+fi
 
 export BACE_EXP_ROOT=${BACE_EXP_ROOT:-/hpcwork/xsz96350/fu_project/work-BACE/experiments/alfworld-qwen2.5-1.5b-exact}
 export BACE_RUN_NAME=${BACE_RUN_NAME:-bace_alfworld_qwen2_5_1_5b_exact_main_seed0}
@@ -36,12 +44,17 @@ export TEST_FREQ=5
 export ACTOR_MICRO_BATCH
 export LOGPROB_MICRO_BATCH=${ACTOR_MICRO_BATCH}
 export MAX_CHECKPOINTS
-export MILESTONE_CHECKPOINT_STEPS
+export BACE_SEED
 unset CHECKPOINT_DIR BACE_ARTIFACT_DIR ROLLOUT_DATA_DIR TENSORBOARD_DIR
 unset RUN_METADATA_DIR TRACE_VALIDATION_REPORT LOG_FILE
 
 checkpoint_root=${BACE_EXP_ROOT}/checkpoints/${BACE_RUN_NAME}
-export MILESTONE_CHECKPOINT_DIR=${BACE_EXP_ROOT}/preserved_checkpoints/${BACE_RUN_NAME}
+if [[ "${MILESTONE_CHECKPOINT_ENABLED}" == true ]]; then
+    export MILESTONE_CHECKPOINT_STEPS
+    export MILESTONE_CHECKPOINT_DIR=${BACE_EXP_ROOT}/preserved_checkpoints/${BACE_RUN_NAME}
+else
+    unset MILESTONE_CHECKPOINT_STEPS MILESTONE_CHECKPOINT_DIR
+fi
 artifact_root=${BACE_EXP_ROOT}/bace_artifacts/${BACE_RUN_NAME}
 metadata_dir=${BACE_EXP_ROOT}/run_metadata/${BACE_RUN_NAME}/${BACE_INVOCATION_ID}
 report_dir=${BACE_EXP_ROOT}/trace_validation/${BACE_RUN_NAME}

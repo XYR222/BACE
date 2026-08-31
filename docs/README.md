@@ -32,6 +32,7 @@
 - S3（main pool 复用 + active-root executor）已通过 4×H100 专项门禁，是新实验推荐执行配置；Rmin=4 仍是小样本诊断项，方法默认保持 Rmin=2。
 - 原 Slurm/H100 作业链对换设备没有复用价值；只把它当配置和事故证据。
 - Pairwise 当前结论是 `HOLD / ABLATION ONLY`：实现和离线分析已完成，在线 C0/C1/C2 smoke 尚未完成。
+- 2026-08-31 已提交 P1-S BACE 2/4 卡多 seed、Pairwise C1/C2 full run 和 GiGPO legacy-float32 多 seed；审计时均仍为 pending，不能当作完成结果。
 - 本次分支的准确 CPU 基线见 01 文档；新设备仍须复现单测、dry-run、一步 smoke 和跨进程恢复，再决定正式运行参数。
 
 所有旧文档均保留，没有删除。读到任何“尚未完成 150 step”“当前阻塞于 step 3”“StateID 已实现”之类说法时，先回到 01 和 06 文档核对。

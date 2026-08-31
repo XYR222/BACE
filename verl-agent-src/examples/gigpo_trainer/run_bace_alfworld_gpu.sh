@@ -88,6 +88,11 @@ val_before_train=${VAL_BEFORE_TRAIN:-false}
 resume_mode=${BACE_RESUME_MODE:-disable}
 logger_backends=${LOGGER_BACKENDS:-"['console','tensorboard']"}
 num_cpus_per_env_worker=${NUM_CPUS_PER_ENV_WORKER:-0.1}
+bace_seed=${BACE_SEED:-0}
+[[ "${bace_seed}" =~ ^[0-9]+$ ]] || {
+    echo "BACE_SEED must be a non-negative integer." >&2
+    exit 2
+}
 
 if (( rollout_tp > GPU_COUNT || GPU_COUNT % rollout_tp != 0 )); then
     echo "ROLLOUT_TP=${rollout_tp} must divide GPU_COUNT=${GPU_COUNT}." >&2
@@ -130,8 +135,8 @@ fi
     git_head=$(git rev-parse HEAD 2>/dev/null || printf 'unavailable')
     printf 'run_name=%q\nstart_time=%q\nrepo_root=%q\nbundle_root=%q\n' \
         "${BACE_RUN_NAME}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${REPO_ROOT}" "${BUNDLE_ROOT}"
-    printf 'git_head=%q\nengine=%q\nvisible_devices=%q\ngpu_count=%q\n' \
-        "${git_head}" "${ENGINE}" "${CUDA_VISIBLE_DEVICES}" "${GPU_COUNT}"
+    printf 'git_head=%q\nengine=%q\nvisible_devices=%q\ngpu_count=%q\nseed=%q\n' \
+        "${git_head}" "${ENGINE}" "${CUDA_VISIBLE_DEVICES}" "${GPU_COUNT}" "${bace_seed}"
     printf 'model_path=%q\nalfworld_data=%q\ntrain_file=%q\nval_file=%q\n' \
         "${MODEL_PATH}" "${ALFWORLD_DATA}" "${TRAIN_FILE}" "${VAL_FILE}"
     printf 'variant=batch_erv_exact topology=dynamic generation=staged batching=packed branch_execution=selected_worker acquisition=batch_erv_exact invalid_action_mode=strict_identity\n'
@@ -317,7 +322,7 @@ ppo_command=(python3 -m verl.trainer.main_ppo
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1
     algorithm.use_kl_in_reward=false
     env.env_name=alfworld/AlfredTWEnv
-    env.seed=0
+    env.seed="${bace_seed}"
     env.max_steps="${max_steps}"
     env.rollout.n="${group_size}"
     env.resources_per_worker.num_cpus="${num_cpus_per_env_worker}"

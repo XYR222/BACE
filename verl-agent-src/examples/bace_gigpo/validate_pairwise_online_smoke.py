@@ -46,11 +46,12 @@ def main() -> None:
 
         rounds = jsonl(step_dir / "acquisition_rounds.jsonl")
         active_rounds = [item for item in rounds if item.get("requests")]
+        requested = float(metrics.get("requested", 0.0))
         # Each record is emitted once by coordinator.build_round_requests(),
         # before any branch execution.  A late round can legitimately contain
         # branches of a single still-active task, so task-count alone is not a
         # valid sequential-execution detector.
-        if not active_rounds and float(metrics.get("requested", 0.0)) > 0:
+        if not active_rounds and requested > 0:
             step_errors.append("missing_global_acquisition_round_record")
 
         if args.arm == "c0":
@@ -65,7 +66,7 @@ def main() -> None:
                 step_errors.append("c1_pairwise_flags")
             if float(metrics.get("fallback_root_count", 0.0)) != 0.0:
                 step_errors.append("c1_has_fallback_roots")
-            if float(metrics.get("pairwise_branch_rounds", 0.0)) < 1.0:
+            if requested > 0 and float(metrics.get("pairwise_branch_rounds", 0.0)) < 1.0:
                 step_errors.append("c1_has_no_pairwise_round")
         else:
             if float(metrics.get("pairwise_fixed", 0.0)) != 0.0 or float(
@@ -73,9 +74,11 @@ def main() -> None:
             ) != 1.0:
                 step_errors.append("c2_pairwise_flags")
             checks = jsonl(step_dir / "capacity_checks.jsonl")
-            if not any(check.get("lazy_pairwise_capacity") for check in checks):
+            if requested > 0 and not any(
+                check.get("lazy_pairwise_capacity") for check in checks
+            ):
                 step_errors.append("c2_missing_lazy_capacity_record")
-            if float(metrics.get("pairwise_branch_rounds", 0.0)) < 1.0:
+            if requested > 0 and float(metrics.get("pairwise_branch_rounds", 0.0)) < 1.0:
                 step_errors.append("c2_has_no_pairwise_round")
 
         steps.append({
@@ -83,6 +86,7 @@ def main() -> None:
             "ok": not step_errors,
             "errors": step_errors,
             "pairwise_rounds": metrics.get("pairwise_branch_rounds"),
+            "requested": requested,
             "fallback_root_count": metrics.get("fallback_root_count", 0.0),
             "global_round_records": len(active_rounds),
             "time": {
