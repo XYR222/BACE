@@ -98,6 +98,9 @@ def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
 
     # check if the batch size is divisible by the dp size, if not, delete the last few samples to make it divisible
     bs = len(data)
+    # Preserve which rows are real rollout occurrences.  Tree-credit variants
+    # must not mistake divisibility-only copies for additional concrete edges.
+    data.non_tensor_batch["_adjust_batch_padding"] = np.zeros(bs, dtype=bool)
     remainder = bs % size_divisor
     if remainder == 0:
         return data
@@ -124,6 +127,9 @@ def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
         dup_proto = data.select_idxs(dup_indices)
 
         adjusted_batch = DataProto.concat([data, dup_proto])
+        adjusted_batch.non_tensor_batch["_adjust_batch_padding"] = np.concatenate(
+            [np.zeros(bs, dtype=bool), np.ones(to_add, dtype=bool)]
+        )
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 
@@ -182,4 +188,3 @@ def filter_group_data(batch_list : List[Dict],
     tool_callings = tool_callings[keep_indices]
 
     return batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
-

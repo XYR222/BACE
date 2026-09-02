@@ -23,8 +23,11 @@ class ReplayCategory(str, Enum):
 
 
 class ReplayValidator:
-    def __init__(self, compare_action_set: bool = True):
+    def __init__(self, compare_action_set: bool = True, action_is_executable=None):
         self.compare_action_set = compare_action_set
+        self.action_is_executable = action_is_executable or (
+            lambda action, action_set: action in action_set
+        )
 
     def validate(self, request: ReplayRequest, observation, action_set, done: bool) -> ReplayResult:
         restored_key = to_hashable(observation)
@@ -34,9 +37,10 @@ class ReplayValidator:
             category = ReplayCategory.EARLY_TERMINATION
         elif restored_key != expected_key:
             category = ReplayCategory.ANCHOR_KEY_MISMATCH
-        elif request.copied_action_environment_valid is not False and (
-            request.copied_parsed_environment_action or request.selected_canonical_action
-        ) not in restored_actions:
+        elif request.copied_action_environment_valid is not False and not self.action_is_executable(
+            request.copied_parsed_environment_action or request.selected_canonical_action,
+            restored_actions,
+        ):
             category = ReplayCategory.SELECTED_ACTION_NOT_EXECUTABLE
         elif self.compare_action_set and set(restored_actions) != set(request.expected_action_set):
             category = ReplayCategory.ACTION_SET_MISMATCH

@@ -213,6 +213,107 @@ def validate_step(step_dir: Path, max_recomputed_logprob_diff=None,
     if unknown_trained:
         errors.append(f"training batch contains failed/unknown branches: {sorted(unknown_trained)}")
 
+    tree_credit_mode = str(manifest.get("tree_credit_mode", "current"))
+    macro_normalization_mode = str(
+        manifest.get("macro_normalization_mode", "stable_occurrence")
+    )
+    if tree_credit_mode != "current":
+        if tree_credit_mode not in {"o1_local", "o1_tree_macro", "o1_full_tree"}:
+            errors.append(f"unknown tree credit mode: {tree_credit_mode}")
+        if macro_normalization_mode != "stable_occurrence":
+            errors.append(
+                "tree credit unexpectedly changed macro normalization away from stable_occurrence"
+            )
+        if by_source.get("branch_origin"):
+            errors.append("tree-credit PPO support contains copied branch origins")
+        edge_ids = [str(record.get("edge_id")) for record in occurrences]
+        if len(edge_ids) != len(set(edge_ids)):
+            errors.append("tree-credit PPO support contains duplicate concrete edge IDs")
+        required_tree_fields = {
+            "edge_id", "root_id", "step_index", "direct_leaf_ids",
+            "descendant_leaf_ids", "num_direct_continuations",
+            "num_descendant_leaves", "g_original", "g_direct_mean",
+            "g_descendant_mean", "macro_base_stable",
+            "macro_descendant_mean", "local_current", "local_c1",
+            "local_c3", "final_current", "final_c1", "final_c2",
+            "final_c3", "tree_credit_mode", "macro_normalization_mode",
+        }
+        for occurrence in occurrences:
+            occurrence_id = occurrence.get("occurrence_id")
+            missing = sorted(required_tree_fields.difference(occurrence))
+            if missing:
+                errors.append(
+                    f"occurrence {occurrence_id}: missing tree-credit fields {missing}"
+                )
+                continue
+            direct = occurrence["direct_leaf_ids"]
+            descendants = occurrence["descendant_leaf_ids"]
+            if len(direct) != int(occurrence["num_direct_continuations"]):
+                errors.append(f"occurrence {occurrence_id}: direct leaf count mismatch")
+            if len(descendants) != int(occurrence["num_descendant_leaves"]):
+                errors.append(f"occurrence {occurrence_id}: descendant leaf count mismatch")
+            if occurrence["tree_credit_mode"] != tree_credit_mode:
+                errors.append(f"occurrence {occurrence_id}: tree-credit mode mismatch")
+            if occurrence["macro_normalization_mode"] != macro_normalization_mode:
+                errors.append(f"occurrence {occurrence_id}: macro-normalization mode mismatch")
+            expected_components = {
+                "o1_local": ("macro_base_stable", "local_c1", "final_c1"),
+                "o1_tree_macro": (
+                    "macro_descendant_mean", "local_c1", "final_c2"
+                ),
+                "o1_full_tree": (
+                    "macro_descendant_mean", "local_c3", "final_c3"
+                ),
+            }.get(tree_credit_mode)
+            if expected_components is not None:
+                macro_name, local_name, final_name = expected_components
+                comparisons = (
+                    ("macro_advantage", macro_name),
+                    ("local_advantage", local_name),
+                    ("occurrence_advantage", final_name),
+                )
+                for selected_name, expected_name in comparisons:
+                    if not math.isclose(
+                        float(occurrence[selected_name]),
+                        float(occurrence[expected_name]),
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    ):
+                        errors.append(
+                            f"occurrence {occurrence_id}: {selected_name} does not "
+                            f"match {expected_name} for {tree_credit_mode}"
+                        )
+        checks["tree_credit"] = {
+            "mode": tree_credit_mode,
+            "macro_normalization_mode": macro_normalization_mode,
+            "unique_trainable_edges": len(edge_ids),
+            "copied_origins_trainable": len(by_source.get("branch_origin", [])),
+        }
+        tree_branches = streams.get("tree_credit_branches", [])
+        tree_branch_by_id = {
+            str(record.get("branch_id")): record for record in tree_branches
+        }
+        if set(tree_branch_by_id) != set(successful_branches):
+            errors.append(
+                "tree-credit branch evidence does not match the successfully executed branches"
+            )
+        required_branch_fields = {
+            "branch_id", "origin_occurrence_id", "parent_root_id",
+            "origin_step_index", "leaf_id", "origin_g_branch",
+            "terminal_reward",
+        }
+        for branch_id, record in tree_branch_by_id.items():
+            missing = sorted(required_branch_fields.difference(record))
+            if missing:
+                errors.append(
+                    f"branch {branch_id}: missing tree-credit evidence fields {missing}"
+                )
+            original = successful_branches.get(branch_id)
+            if original is not None and record.get("origin_occurrence_id") != original.get(
+                "origin_occurrence_id"
+            ):
+                errors.append(f"branch {branch_id}: tree-credit origin mismatch")
+
     advantage_semantics = manifest.get("advantage_semantics", "leaf_uniform")
     if advantage_semantics == "leaf_uniform":
         for leaf_id, records in by_leaf.items():

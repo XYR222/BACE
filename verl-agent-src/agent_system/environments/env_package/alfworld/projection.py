@@ -15,31 +15,22 @@
 
 from typing import List
 import re
+from agent_system.environments.strict_actions import (
+    parse_tagged_action_response,
+    strict_action_identity,
+)
 
 
 def parse_alfworld_action_response(response: str):
     """Return the exact trimmed action body and structural format validity."""
-    lowered = response.lower()
-    start_tag = "<action>"
-    end_tag = "</action>"
-    start_idx = lowered.find(start_tag)
-    end_idx = lowered.find(end_tag)
-    if start_idx == -1 or end_idx == -1 or end_idx < start_idx:
-        return None, False
-    action_body = response[start_idx + len(start_tag):end_idx].strip()
-    has_think = response.find("<think>") != -1 and response.find("</think>") != -1
-    has_chinese = re.search(r'[\u4e00-\u9fff]', response) is not None
-    return action_body, bool(action_body) and has_think and not has_chinese
+    return parse_tagged_action_response(response)
 
 
 def alfworld_action_identity(response: str, projected_action: str,
                              format_valid: bool, environment_valid: bool):
-    if not format_valid:
-        return None
-    if environment_valid:
-        return f"valid::{projected_action}"
-    raw_action_body, _ = parse_alfworld_action_response(response)
-    return f"invalid::{raw_action_body}"
+    return strict_action_identity(
+        response, projected_action, format_valid, environment_valid
+    )
 
 def alfworld_projection(actions: List[str], action_pools: List[List[str]]):
     """

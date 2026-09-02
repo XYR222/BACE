@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import statistics
 import sys
 import time
@@ -24,10 +25,15 @@ for path in (REPO_ROOT, WEBSHOP_PACKAGE):
 # PyJNIus does not reliably discover a Conda OpenJDK when the environment's
 # Python is invoked by absolute path without `conda activate`.
 if "JVM_PATH" not in os.environ:
-    candidate = Path(sys.prefix) / "lib/server/libjvm.so"
-    if candidate.is_file():
-        os.environ["JAVA_HOME"] = str(Path(sys.prefix))
-        os.environ["JVM_PATH"] = str(candidate)
+    candidates = [
+        Path(sys.prefix) / "lib/jvm/lib/server/libjvm.so",
+        Path(sys.prefix) / "lib/server/libjvm.so",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            os.environ["JAVA_HOME"] = str(candidate.parents[2])
+            os.environ["JVM_PATH"] = str(candidate)
+            break
 
 from agent_system.environments.env_package.webshop.envs import (
     RayLuceneSearchClient,
@@ -347,13 +353,42 @@ def main():
     parser.add_argument("--init-batch-size", type=int, default=16)
     parser.add_argument("--sessions-per-actor", type=int, default=8)
     parser.add_argument("--sessions", type=int, nargs="+", default=[500, 501, 502])
+    parser.add_argument("--ray-num-cpus", type=int, default=2)
+    parser.add_argument("--timeout-seconds", type=int, default=600)
     args = parser.parse_args()
-    passed = {
-        "parity": run_parity,
-        "search-stress": run_search_stress,
-        "env-stress": run_env_stress,
-        "semantic": run_semantic,
-    }[args.mode](args)
+    if args.ray_num_cpus <= 0:
+        raise ValueError("--ray-num-cpus must be positive")
+    if args.timeout_seconds <= 0:
+        raise ValueError("--timeout-seconds must be positive")
+
+    def _timeout_handler(_signum, _frame):
+        raise TimeoutError(
+            f"WebShop {args.mode} validation exceeded {args.timeout_seconds} seconds"
+        )
+
+    # Keep standalone diagnostics small and self-cleaning.  Production
+    # trainers initialize Ray before constructing WebShop environments.
+    owns_ray = not ray.is_initialized()
+    if owns_ray:
+        ray.init(
+            num_cpus=args.ray_num_cpus,
+            include_dashboard=False,
+            log_to_driver=True,
+        )
+    previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(args.timeout_seconds)
+    try:
+        passed = {
+            "parity": run_parity,
+            "search-stress": run_search_stress,
+            "env-stress": run_env_stress,
+            "semantic": run_semantic,
+        }[args.mode](args)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if owns_ray and ray.is_initialized():
+            ray.shutdown()
     print(json.dumps({"mode": args.mode, "output": str(args.output), "passed": passed}, indent=2))
     return 0 if passed else 1
 

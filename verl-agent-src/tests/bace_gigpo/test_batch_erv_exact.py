@@ -222,7 +222,7 @@ def test_large_q6_capacity_two_global_dp_is_fast():
     assert result.solver_wall_time_ms < 1000.0
 
 
-def make_exact_planner(history, budget=4):
+def make_exact_planner(history, budget=4, correction_batch_size=1):
     return ExactBatchTopologyPlanner(
         history=history,
         total_budget=budget,
@@ -234,6 +234,7 @@ def make_exact_planner(history, budget=4):
         tie_abs_tolerance=1e-12,
         tie_rel_tolerance=1e-10,
         seed=5,
+        capacity_correction_batch_size=correction_batch_size,
     )
 
 
@@ -273,6 +274,36 @@ def test_exact_capacity_correction_is_one_way_and_preserves_budget():
     assert task.initial_information_capacity == 0
     assert task.initial_quota_deficit == 2
     assert task.initial_normalized_quota_deficit == 1.0
+
+
+def test_exact_capacity_correction_can_convert_two_slots_in_one_wave():
+    history = CompetenceHistory()
+    history.update({"pick_and_place": [True] * 20})
+    planner = make_exact_planner(history, correction_batch_size=2)
+    states = planner.initialize({"task-1": "pick_and_place"})
+    state = states["task-1"]
+    initial = [won(root("r1", "open fridge")), won(root("r2", "open fridge"))]
+
+    assert planner.correct_capacity(initial, states) == {"task-1"}
+    assert (state.root_count, state.branch_count, state.correction_count) == (4, 0, 2)
+
+    corrected = initial + [root("r3", "go to table"), root("r4", "go to table")]
+    assert planner.correct_capacity(corrected, states) == set()
+    plan = planner.finalize(corrected, states)
+    assert (plan.tasks["task-1"].final_root_count, plan.tasks["task-1"].final_branch_count) == (4, 0)
+
+
+def test_exact_capacity_correction_batch_is_capped_by_remaining_branch_quota():
+    history = CompetenceHistory()
+    planner = make_exact_planner(history, correction_batch_size=2)
+    states = planner.initialize({"task-1": "pick_and_place"})
+    state = states["task-1"]
+    state.root_count = 3
+    state.branch_count = 1
+    initial = [root("r1", "open fridge"), root("r2", "open fridge"), root("r3", "open fridge")]
+
+    assert planner.correct_capacity(initial, states) == {"task-1"}
+    assert (state.root_count, state.branch_count, state.correction_count) == (4, 0, 1)
 
 
 def test_exact_coordinator_emits_all_branches_in_one_frozen_batch():

@@ -30,6 +30,8 @@ TRAIN_FILE=${WORKSPACE_ROOT}/data/text/train.parquet
 VAL_FILE=${WORKSPACE_ROOT}/data/text/test.parquet
 PAIRWISE_ARM=${PAIRWISE_ARM:?Set PAIRWISE_ARM to c0, c1, or c2}
 PAIRWISE_PHASE=${PAIRWISE_PHASE:-smoke}
+MIN_NATURAL_ROOTS=${MIN_NATURAL_ROOTS:-2}
+CAPACITY_CORRECTION_BATCH_SIZE=${CAPACITY_CORRECTION_BATCH_SIZE:-1}
 SOURCE_STEP=${SOURCE_STEP:-100}
 SOURCE_CHECKPOINT=${SOURCE_CHECKPOINT:-${EXP_ROOT}/preserved_checkpoints/bace_alfworld_qwen2_5_1_5b_exact_2gpu_mem244_retry/global_step_${SOURCE_STEP}}
 TARGET_STEP=${TARGET_STEP:-}
@@ -70,6 +72,8 @@ case "${PAIRWISE_PHASE}" in
         ;;
 esac
 [[ "${TARGET_STEP}" =~ ^[0-9]+$ ]]
+[[ "${MIN_NATURAL_ROOTS}" =~ ^[0-9]+$ ]] && (( MIN_NATURAL_ROOTS >= 1 && MIN_NATURAL_ROOTS <= 8 ))
+[[ "${CAPACITY_CORRECTION_BATCH_SIZE}" =~ ^[0-9]+$ ]] && (( CAPACITY_CORRECTION_BATCH_SIZE >= 1 ))
 
 case "${PAIRWISE_ARM}" in
     c0)
@@ -207,7 +211,8 @@ ppo_command=(
     algorithm.bace.root_active_executor=true
     algorithm.bace.acquisition=batch_erv_exact
     algorithm.bace.total_leaf_budget=8
-    algorithm.bace.min_natural_roots=2
+    algorithm.bace.min_natural_roots="${MIN_NATURAL_ROOTS}"
+    algorithm.bace.capacity_correction_batch_size="${CAPACITY_CORRECTION_BATCH_SIZE}"
     algorithm.bace.max_branches_per_anchor=2
     algorithm.bace.competence_threshold=0.5
     algorithm.bace.history_initial_mean=0.10
@@ -300,8 +305,9 @@ ppo_command=(
 
 printf '%q ' "${ppo_command[@]}" > "${METADATA_DIR}/resolved_command.sh"
 printf '\n' >> "${METADATA_DIR}/resolved_command.sh"
-printf 'arm=%s\nphase=%s\npairwise_mode=%s\nsource_checkpoint=%s\ntarget_step=%s\nscheduling_profile=P1-S(main_reuse+root_active_executor)\ncheckpoint_policy=save_every_%s_keep_latest_%s\n' \
+printf 'arm=%s\nphase=%s\npairwise_mode=%s\nmin_natural_roots=%s\ncapacity_correction_batch_size=%s\nsource_checkpoint=%s\ntarget_step=%s\nscheduling_profile=P1-S(main_reuse+root_active_executor)\ncheckpoint_policy=save_every_%s_keep_latest_%s\n' \
     "${PAIRWISE_ARM}" "${PAIRWISE_PHASE}" "${PAIRWISE_MODE}" \
+    "${MIN_NATURAL_ROOTS}" "${CAPACITY_CORRECTION_BATCH_SIZE}" \
     "$([[ "${PAIRWISE_PHASE}" == full ]] && printf 'fresh' || printf '%s' "${SOURCE_CHECKPOINT}")" \
     "${TARGET_STEP}" "${SAVE_FREQ}" "${MAX_CHECKPOINTS}" > "${METADATA_DIR}/arm_contract.txt"
 (

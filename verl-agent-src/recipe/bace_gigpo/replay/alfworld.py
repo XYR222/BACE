@@ -12,7 +12,10 @@ class ReplayAdapter:
         self.manager = manager
         self.tokenizer = tokenizer
         self.config = config
-        self.validator = ReplayValidator(compare_action_set=compare_action_set)
+        self.validator = ReplayValidator(
+            compare_action_set=compare_action_set,
+            action_is_executable=getattr(manager, "is_action_executable", None),
+        )
 
     def _prompt_token_ids(self, prompt: str) -> tuple[int, ...]:
         rendered = self.tokenizer.apply_chat_template(

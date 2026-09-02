@@ -33,6 +33,8 @@ VAL_FILE=${WORKSPACE_ROOT}/data/text/test.parquet
 EXP_ROOT=${WORKSPACE_ROOT}/work-BACE/experiments/alfworld-qwen2.5-1.5b-exact
 
 TARGET_STEP=${TARGET_STEP:-150}
+MIN_NATURAL_ROOTS=${MIN_NATURAL_ROOTS:-2}
+CAPACITY_CORRECTION_BATCH_SIZE=${CAPACITY_CORRECTION_BATCH_SIZE:-1}
 SCHEDULING_PROFILE=${BACE_SCHEDULING_PROFILE:-legacy}
 case "${SCHEDULING_PROFILE}" in
     legacy)
@@ -52,12 +54,18 @@ esac
 RUN_NAME=${BACE_RUN_NAME:-bace_alfworld_qwen2_5_1_5b_exact_2gpu_reference_seed0}
 INVOCATION_ID=${BACE_INVOCATION_ID:-${SLURM_JOB_ID:-local}_2gpu_${SCHEDULING_PROFILE}_to_step_${TARGET_STEP}}
 SEED=${BACE_SEED:-0}
+TREE_CREDIT_MODE=${TREE_CREDIT_MODE:-current}
+MACRO_NORMALIZATION_MODE=${MACRO_NORMALIZATION_MODE:-stable_occurrence}
 SAVE_FREQ=${SAVE_FREQ:-5}
 MAX_CHECKPOINTS=${MAX_CHECKPOINTS:-2}
 MILESTONE_CHECKPOINT_STEPS=${MILESTONE_CHECKPOINT_STEPS:-10,75,100,140}
 [[ "${RUN_NAME}" =~ ^[A-Za-z0-9_.-]+$ ]]
 [[ "${TARGET_STEP}" =~ ^[0-9]+$ ]] && (( TARGET_STEP >= 1 && TARGET_STEP <= 150 ))
+[[ "${MIN_NATURAL_ROOTS}" =~ ^[0-9]+$ ]] && (( MIN_NATURAL_ROOTS >= 1 && MIN_NATURAL_ROOTS <= 8 ))
+[[ "${CAPACITY_CORRECTION_BATCH_SIZE}" =~ ^[0-9]+$ ]] && (( CAPACITY_CORRECTION_BATCH_SIZE >= 1 ))
 [[ "${SEED}" =~ ^[0-9]+$ ]]
+[[ "${TREE_CREDIT_MODE}" =~ ^(current|o1_local|o1_tree_macro|o1_full_tree)$ ]]
+[[ "${MACRO_NORMALIZATION_MODE}" == stable_occurrence ]]
 [[ "${SAVE_FREQ}" =~ ^[0-9]+$ ]] && (( SAVE_FREQ >= 1 ))
 [[ "${MAX_CHECKPOINTS}" =~ ^(1|2)$ ]]
 if [[ "${MILESTONE_CHECKPOINT_STEPS}" == "none" ]]; then
@@ -156,7 +164,8 @@ ppo_command=(
     algorithm.bace.root_active_executor="${ROOT_ACTIVE_EXECUTOR}"
     algorithm.bace.acquisition=batch_erv_exact
     algorithm.bace.total_leaf_budget=8
-    algorithm.bace.min_natural_roots=2
+    algorithm.bace.min_natural_roots="${MIN_NATURAL_ROOTS}"
+    algorithm.bace.capacity_correction_batch_size="${CAPACITY_CORRECTION_BATCH_SIZE}"
     algorithm.bace.max_branches_per_anchor=2
     algorithm.bace.competence_threshold=0.5
     algorithm.bace.history_initial_mean=0.10
@@ -172,6 +181,8 @@ ppo_command=(
     algorithm.bace.invalid_action_mode=strict_identity
     algorithm.bace.tie_break_identity_mode=stable_v1
     algorithm.bace.local_credit_mode=occurrence
+    algorithm.bace.tree_credit_mode="${TREE_CREDIT_MODE}"
+    algorithm.bace.macro_normalization_mode="${MACRO_NORMALIZATION_MODE}"
     algorithm.bace.artifacts.enabled=true
     algorithm.bace.artifacts.directory="${ARTIFACT_DIR}"
     algorithm.bace.artifacts.include_token_arrays=true
@@ -264,6 +275,10 @@ printf '\n' >> "${METADATA_DIR}/resolved_command.sh"
         "${RUN_NAME}" "${INVOCATION_ID}" "${SEED}"
     printf 'scheduling_profile=%q\nbranch_pool_mode=%q\nroot_active_executor=%q\n' \
         "${SCHEDULING_PROFILE}" "${BRANCH_POOL_MODE}" "${ROOT_ACTIVE_EXECUTOR}"
+    printf 'min_natural_roots=%q\ncapacity_correction_batch_size=%q\n' \
+        "${MIN_NATURAL_ROOTS}" "${CAPACITY_CORRECTION_BATCH_SIZE}"
+    printf 'tree_credit_mode=%q\nmacro_normalization_mode=%q\n' \
+        "${TREE_CREDIT_MODE}" "${MACRO_NORMALIZATION_MODE}"
     printf 'tensorboard_dir=%q\n' "${TENSORBOARD_DIR}"
     printf 'milestone_checkpoint_steps=%q\nmilestone_checkpoint_dir=%q\n' \
         "${MILESTONE_CHECKPOINT_STEPS}" "${MILESTONE_CHECKPOINT_DIR}"

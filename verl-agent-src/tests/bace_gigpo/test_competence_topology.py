@@ -70,6 +70,28 @@ def test_cold_start_prior_plans_zero_branches_for_exact_main_configuration():
     assert (state.root_count, state.branch_count) == (8, 0)
 
 
+def test_exact_rmin4_caps_the_flexible_branch_budget_at_four():
+    history = CompetenceHistory()
+    history.update({"pick_and_place": [True] * 20})
+    planner = ExactBatchTopologyPlanner(
+        history=history,
+        total_budget=8,
+        min_natural_roots=4,
+        competence_threshold=0.5,
+        max_branches_per_anchor=2,
+        local_prior_strength=2.0,
+        batch_erv_threshold=0.005,
+        tie_abs_tolerance=1e-12,
+        tie_rel_tolerance=1e-10,
+    )
+
+    state = planner.initialize({"task-1": "pick_and_place"})["task-1"]
+
+    assert state.root_count >= 4
+    assert state.branch_count <= 4
+    assert state.root_count + state.branch_count == 8
+
+
 def test_competence_history_state_round_trip_and_validation():
     history = CompetenceHistory(
         base_alpha=0.2,

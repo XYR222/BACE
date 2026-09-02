@@ -59,10 +59,35 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         self.branch_pool_mode = str(
             bace_config.get("branch_pool_mode", "dedicated")
         )
+        self.tree_credit_mode = str(
+            bace_config.get("tree_credit_mode", "current")
+        )
+        self.macro_normalization_mode = str(
+            bace_config.get("macro_normalization_mode", "stable_occurrence")
+        )
+        if self.tree_credit_mode not in {
+            "current", "o1_local", "o1_tree_macro", "o1_full_tree"
+        }:
+            raise ValueError(
+                "algorithm.bace.tree_credit_mode must be current, o1_local, "
+                "o1_tree_macro, or o1_full_tree"
+            )
+        if self.macro_normalization_mode != "stable_occurrence":
+            raise ValueError(
+                "C0/C1/C2/C3 currently require "
+                "algorithm.bace.macro_normalization_mode=stable_occurrence"
+            )
         self.branch_pool_owns_resources = self.branch_pool_mode == "dedicated"
         pairwise_config = bace_config.get("pairwise", {})
         self.pairwise_mode = str(pairwise_config.get("mode", "full"))
         self.pairwise_batch_size = int(pairwise_config.get("batch_size", 2))
+        self.capacity_correction_batch_size = int(
+            bace_config.get("capacity_correction_batch_size", 1)
+        )
+        if self.capacity_correction_batch_size < 1:
+            raise ValueError(
+                "algorithm.bace.capacity_correction_batch_size must be positive"
+            )
         self.root_active_executor = bool(
             bace_config.get("root_active_executor", False)
         )
@@ -159,6 +184,8 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 "staged_root_batching=frontier requires topology=dynamic and "
                 "dynamic_root_generation=staged"
             )
+        if self.tree_credit_mode != "current" and self.staged_root_batching == "frontier":
+            raise ValueError("C1/C2/C3 tree credit currently require packed rollout batching")
         if self.variant == "batch_erv_exact" and (
             self.topology != "dynamic"
             or self.dynamic_root_generation != "staged"
@@ -223,6 +250,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                     seed=int(config.env.seed),
                     invalid_action_mode=self.invalid_action_mode,
                     tie_break_identity_mode=self.tie_break_identity_mode,
+                    capacity_correction_batch_size=self.capacity_correction_batch_size,
                 )
             else:
                 self.topology_planner = DynamicTopologyPlanner(
@@ -347,6 +375,13 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 "pairwise_mode": self.pairwise_mode,
                 "pairwise_batch_size": self.pairwise_batch_size,
             })
+        # ``1`` is the historical exact-capacity protocol.  Preserve existing
+        # checkpoints byte-for-byte in that case; any accelerated correction
+        # policy is a distinct sampling schedule and must resume strictly.
+        if self.capacity_correction_batch_size != 1:
+            self.parameter_signature["capacity_correction_batch_size"] = (
+                self.capacity_correction_batch_size
+            )
         # Preserve byte-for-byte compatibility with checkpoints written before
         # stable_v1 existed.  Stable runs add the field, so cross-mode resume is
         # rejected by the existing strict signature comparison.
@@ -354,6 +389,10 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             self.parameter_signature["tie_break_identity_mode"] = (
                 self.tie_break_identity_mode
             )
+        # Tree credit only changes the learner-side use of a completed rollout.
+        # It deliberately stays outside the controller/history signature so the
+        # four variants can fork from one identical BACE checkpoint, as required
+        # by the C0/C1/C2/C3 controlled-comparison protocol.
 
     def set_step(self, step):
         self.current_step = int(step)
@@ -518,6 +557,8 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             "invalid_action_mode": self.invalid_action_mode,
             "tie_break_identity_mode": self.tie_break_identity_mode,
             "local_credit_mode": str(self.config.algorithm.bace.local_credit_mode),
+            "tree_credit_mode": self.tree_credit_mode,
+            "macro_normalization_mode": self.macro_normalization_mode,
             "advantage_semantics": "gigpo_macro",
             "gigpo_mode": str(self.config.algorithm.gigpo.mode),
             "gigpo_compute_mean_std_cross_steps": bool(
@@ -773,6 +814,8 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         source_counts = {}
         old_log_prob_diffs = []
         source_log_prob_stats = {}
+        for branch_record in batch.meta_info.get("tree_credit_branch_evidence", []):
+            self.artifact_store.append("tree_credit_branches", branch_record)
 
         def metadata_value(key, index, default=None):
             values = batch.non_tensor_batch.get(key)
@@ -804,6 +847,11 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 )
                 old_log_prob_diffs.append(diff)
             source_type = str(metadata_value("source_type", index, "unknown"))
+            if source_type == "ppo_padding":
+                self.trace_diagnostics["tree_credit_ppo_padding_rows"] = (
+                    self.trace_diagnostics.get("tree_credit_ppo_padding_rows", 0) + 1
+                )
+                continue
             source_counts[source_type] = source_counts.get(source_type, 0) + 1
             if diff is not None:
                 stats = source_log_prob_stats.setdefault(
@@ -844,6 +892,40 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                        "rollout_vs_recomputed_old_log_prob_mean_abs_diff": mean_diff,
                        "rollout_vs_recomputed_probability_max_abs_diff": probability_max_diff,
                        "response_token_count": token_count}
+            tree_trace_fields = {
+                "edge_id": "bace_edge_id",
+                "root_id": "bace_root_id",
+                "direct_leaf_ids": "bace_direct_leaf_ids",
+                "descendant_leaf_ids": "bace_descendant_leaf_ids",
+                "num_direct_continuations": "bace_num_direct_continuations",
+                "num_descendant_leaves": "bace_num_descendant_leaves",
+                "g_original": "bace_g_original",
+                "g_direct_mean": "bace_g_direct_mean",
+                "g_descendant_mean": "bace_g_descendant_mean",
+                "macro_base_stable": "bace_macro_base_stable",
+                "macro_descendant_mean": "bace_macro_descendant_mean",
+                "local_current": "bace_local_current",
+                "local_c1": "bace_local_c1",
+                "local_c3": "bace_local_c3",
+                "final_current": "bace_final_current",
+                "final_c1": "bace_final_c1",
+                "final_c2": "bace_final_c2",
+                "final_c3": "bace_final_c3",
+                "tree_credit_mode": "bace_tree_credit_mode",
+                "macro_normalization_mode": "bace_macro_normalization_mode",
+            }
+            for trace_name, metadata_name in tree_trace_fields.items():
+                value = metadata_value(metadata_name, index)
+                if value is not None:
+                    payload[trace_name] = value
+            if metadata_value("tree_origin_occurrence_id", index) is not None:
+                payload["origin_occurrence_id"] = metadata_value(
+                    "tree_origin_occurrence_id", index
+                )
+                payload["parent_root_id"] = metadata_value(
+                    "tree_parent_root_id", index
+                )
+                payload["step_index"] = metadata_value("step_index", index)
             if include_token_arrays and mask is not None:
                 response_values = responses[index].detach().cpu().numpy() if responses is not None else None
                 payload.update({
@@ -893,6 +975,49 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         size = len(batch)
         batch.non_tensor_batch["source_type"] = np.array([source_type] * size, dtype=object)
         batch.non_tensor_batch["leaf_id"] = np.asarray(leaf_ids, dtype=object)
+
+    @staticmethod
+    def _annotate_tree_lineage(batch, branch_origin_by_id):
+        """Attach exact root/branch ancestry after all physical rows are merged."""
+        sources = np.asarray(batch.non_tensor_batch["source_type"], dtype=object)
+        occurrences = np.asarray(batch.non_tensor_batch["occurrence_id"], dtype=object)
+        trajectories = np.asarray(batch.non_tensor_batch["traj_uid"], dtype=object)
+        natural_parent_by_occurrence = {
+            str(occurrence): str(trajectory)
+            for source, occurrence, trajectory in zip(sources, occurrences, trajectories)
+            if str(source) == "root"
+        }
+        origin_ids = []
+        parent_root_ids = []
+        for source, occurrence, trajectory in zip(sources, occurrences, trajectories):
+            source = str(source)
+            trajectory = str(trajectory)
+            if source == "root":
+                natural_origin = str(occurrence)
+                parent_root = trajectory
+            elif source in {"branch_origin", "branch_suffix"}:
+                if trajectory not in branch_origin_by_id:
+                    raise ValueError(
+                        f"Missing tree-credit origin metadata for branch {trajectory}"
+                    )
+                natural_origin = str(branch_origin_by_id[trajectory])
+                if natural_origin not in natural_parent_by_occurrence:
+                    raise ValueError(
+                        f"Branch {trajectory} references unavailable natural origin "
+                        f"{natural_origin}"
+                    )
+                parent_root = natural_parent_by_occurrence[natural_origin]
+            else:
+                raise ValueError(f"Unknown BACE occurrence source: {source}")
+            origin_ids.append(natural_origin)
+            parent_root_ids.append(parent_root)
+        batch.non_tensor_batch["tree_origin_occurrence_id"] = np.asarray(
+            origin_ids, dtype=object
+        )
+        batch.non_tensor_batch["tree_parent_root_id"] = np.asarray(
+            parent_root_ids, dtype=object
+        )
+        return batch
 
     @staticmethod
     def _rollout_generation_metrics(batch):
@@ -2864,6 +2989,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         self._trace_topology(topology_plan, root_logs)
 
         batches = [root_output]
+        branch_origin_by_id = {}
         requested = 0
         validated = 0
         erv_rounds = 0
@@ -2910,6 +3036,10 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 validated += len(valid)
                 if not valid:
                     continue
+                branch_origin_by_id.update({
+                    request.branch_id: request.origin_occurrence_id
+                    for request in valid
+                })
                 if self.artifact_store is not None:
                     for request, reward in zip(valid, terminal_rewards):
                         suffix_ids = [] if suffix_output is None else [
@@ -2954,6 +3084,10 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 )
                 validated = len(valid)
                 if valid:
+                    branch_origin_by_id.update({
+                        request.branch_id: request.origin_occurrence_id
+                        for request in valid
+                    })
                     if self.artifact_store is not None:
                         for request in valid:
                             self.artifact_store.append("branches", {
@@ -3094,6 +3228,9 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                     task_id: count for task_id, count in generated_by_task.items()
                 }
             topology_metrics = {
+                "capacity_correction_batch_size": float(
+                    self.capacity_correction_batch_size
+                ),
                 "quota_policy_current": float(self.quota_policy == "current"),
                 "quota_policy_conservative_rmin4": float(
                     self.quota_policy == "conservative_rmin4"
@@ -3213,6 +3350,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 })
 
         if len(batches) == 1:
+            self._annotate_tree_lineage(root_output, branch_origin_by_id)
             replay_seconds = sum(
                 self.trace_diagnostics.get("phase_timing_seconds", {}).values()
             )
@@ -3236,6 +3374,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             return root_output
         concat_started = time.monotonic()
         merged_output = self._concat_batches(batches)
+        self._annotate_tree_lineage(merged_output, branch_origin_by_id)
         self.orchestration_metrics["training_batch_concat_seconds"] = float(
             time.monotonic() - concat_started
         )

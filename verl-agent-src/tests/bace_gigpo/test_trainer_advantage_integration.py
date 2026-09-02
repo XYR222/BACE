@@ -136,3 +136,49 @@ def test_trainer_bace_macro_reads_invalid_penalty_from_token_rewards():
 
     expected = np.array([0.7071068, -0.7071068])
     assert np.allclose(batch.non_tensor_batch["bace_macro_advantage"], expected, atol=1e-5)
+
+
+def test_trainer_tree_credit_filters_copied_origin_before_ppo():
+    batch = DataProto.from_single_dict(data={
+        "attention_mask": torch.ones((4, 2), dtype=torch.long),
+        "token_level_rewards": torch.tensor([[0.0], [1.0], [0.0], [1.0]]),
+        "step_rewards": torch.tensor([1.0, 2.0, 4.0, 3.0]),
+        "response_mask": torch.ones((4, 1)),
+        "loss_mask": torch.ones((4, 2)),
+        "anchor_obs": np.array(["z", "y", "z", "q"], dtype=object),
+        "uid": np.array(["task"] * 4, dtype=object),
+        "traj_uid": np.array(["root", "root", "branch", "branch"], dtype=object),
+        "occurrence_id": np.array(["e0", "e1", "bo", "bs"], dtype=object),
+        "source_type": np.array(["root", "root", "branch_origin", "branch_suffix"], dtype=object),
+        "leaf_id": np.array(["lr", "lr", "lb", "lb"], dtype=object),
+        "step_index": np.array([0, 1, 0, 1]),
+        "rewards": np.array([0.0, 1.0, 0.0, 1.0]),
+        "episode_rewards": np.array([1.0, 1.0, 1.0, 1.0]),
+        "tree_origin_occurrence_id": np.array(["e0", "e1", "e0", "e0"], dtype=object),
+        "tree_parent_root_id": np.array(["root"] * 4, dtype=object),
+        "action_identity": np.array(["a", "b", "a", "c"], dtype=object),
+        "projected_action": np.array(["a", "b", "a", "c"], dtype=object),
+    })
+    result = compute_advantage(
+        batch,
+        adv_estimator=AdvantageEstimator.BACE_GiGPO,
+        step_advantage_w=1.0,
+        gamma=1.0,
+        gigpo_mode="mean_norm",
+        bace_tree_credit_mode="o1_local",
+        bace_macro_normalization_mode="stable_occurrence",
+        bace_ppo_world_size=2,
+    )
+    assert len(result) == 4
+    assert result.non_tensor_batch["source_type"].tolist() == [
+        "root", "root", "branch_suffix", "ppo_padding"
+    ]
+    assert "branch_origin" not in result.non_tensor_batch["source_type"]
+    assert result.non_tensor_batch["bace_edge_id"].tolist() == [
+        "e0", "e1", "bs", "ppo-padding-0"
+    ]
+    assert not result.batch["loss_mask"][-1].any()
+    assert not result.batch["response_mask"][-1].any()
+    assert result.meta_info["tree_credit_diagnostics"][
+        "tree_credit_copied_origins_removed"
+    ] == 1.0

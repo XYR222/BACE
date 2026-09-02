@@ -24,7 +24,13 @@ from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory
 from omegaconf import OmegaConf
-from agent_system.environments.env_package.alfworld.projection import alfworld_action_identity
+from agent_system.environments.strict_actions import (
+    strict_action_identity,
+    webshop_action_is_executable,
+)
+
+alfworld_action_identity = strict_action_identity
+webshop_action_identity = strict_action_identity
 
 def parse_gamefile(infos):
     gamefile = []
@@ -619,7 +625,222 @@ class GymCardEnvironmentManager(EnvironmentManagerBase):
 class WebshopEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
+        # Optimized BACE scheduling addresses persistent logical WebShop
+        # sessions directly. Keep this state separate from the legacy
+        # batch-global fields used by ordinary GiGPO rollouts.
+        self._bace_slots = {}
         super().__init__(envs, projection_f, config)
+
+    @staticmethod
+    def _extract_one_task(raw_obs):
+        parts = raw_obs.split(" [SEP] ")
+        if len(parts) < 3 or parts[1] != 'Instruction:':
+            raise ValueError("WebShop task description not found in observation")
+        return parts[2]
+
+    @staticmethod
+    def _format_one_obs(raw_obs, task):
+        parts = raw_obs.split(" [SEP] ")
+        try:
+            index = parts.index(task)
+            return " [SEP] ".join(f"'{part}'" for part in parts[index + 1:])
+        except ValueError:
+            return raw_obs
+
+    @staticmethod
+    def _history_context(history, history_length):
+        recent = history[-history_length:]
+        start_idx = len(history) - len(recent)
+        lines = [
+            f"[Observation {start_idx + offset + 1}: '{record['text_obs']}', "
+            f"Action {start_idx + offset + 1}: '{record['action']}']"
+            for offset, record in enumerate(recent)
+        ]
+        return "\n".join(lines), len(recent)
+
+    def _build_selected_prompt(self, state, init=False):
+        available = "\n".join(
+            f"'{action}'," for action in state['admissible_actions']
+        )
+        history = state['history']
+        if init or self.config.env.history_length <= 0 or not history:
+            return WEBSHOP_TEMPLATE_NO_HIS.format(
+                task_description=state['task'],
+                current_observation=state['text_obs'],
+                available_actions=available,
+            )
+        context, valid_len = self._history_context(
+            history, int(self.config.env.history_length)
+        )
+        prompt = WEBSHOP_TEMPLATE.format(
+            task_description=state['task'],
+            step_count=len(history),
+            history_length=valid_len,
+            action_history=context,
+            current_step=len(history) + 1,
+            current_observation=state['text_obs'],
+            available_actions=available,
+        )
+        if len(prompt) > 13000:
+            return WEBSHOP_TEMPLATE_NO_HIS.format(
+                task_description=state['task'],
+                current_observation=state['text_obs'],
+                available_actions=available,
+            )
+        return prompt
+
+    def _selected_observations(self, worker_indices, init=False):
+        states = [self._bace_slots[int(index)] for index in worker_indices]
+        return {
+            'text': [self._build_selected_prompt(state, init=init) for state in states],
+            'image': None,
+            'anchor': [state['text_obs'] for state in states],
+            'admissible_actions': [list(state['admissible_actions']) for state in states],
+        }
+
+    def is_action_executable(self, action, action_pool):
+        return webshop_action_is_executable(action, action_pool)
+
+    def _selected_indices(self, worker_indices, *, operation):
+        """Validate a selected-worker request before it reaches Ray.
+
+        The packed WebShop implementation deliberately permits arbitrary
+        logical slots.  Rejecting empty, duplicate and out-of-pool requests
+        here prevents a malformed BACE branch plan from accidentally stepping
+        a different packed session.
+        """
+        indices = [int(index) for index in worker_indices]
+        if not indices:
+            raise ValueError(f"{operation} requires at least one WebShop worker")
+        if len(set(indices)) != len(indices):
+            raise ValueError(f"{operation} requires unique WebShop workers")
+        capacity = int(self.envs.num_processes)
+        if min(indices) < 0 or max(indices) >= capacity:
+            raise ValueError(
+                f"{operation} worker index must be in [0, {capacity}), got {indices}"
+            )
+        return indices
+
+    def _selected_states(self, worker_indices, *, operation):
+        indices = self._selected_indices(worker_indices, operation=operation)
+        missing = [index for index in indices if index not in self._bace_slots]
+        if missing:
+            raise ValueError(
+                f"BACE WebShop slots have not been reset before {operation}: {missing}"
+            )
+        return indices, [self._bace_slots[index] for index in indices]
+
+    def reset_selected(self, worker_indices, session_ids=None):
+        worker_indices = self._selected_indices(worker_indices, operation="reset_selected")
+        if session_ids is not None and len(session_ids) != len(worker_indices):
+            raise ValueError("session_ids must match reset_selected workers")
+        raw_obs, infos = self.envs.reset_selected(worker_indices, session_ids)
+        for index, observation, info in zip(worker_indices, raw_obs, infos):
+            task = self._extract_one_task(observation)
+            self._bace_slots[index] = {
+                'text_obs': self._format_one_obs(observation, task),
+                'task': task,
+                'session_idx': int(info['session_idx']),
+                'admissible_actions': tuple(
+                    self.format_avail_actions(info['available_actions'])
+                ),
+                'history': [],
+                'done': False,
+            }
+        return self._selected_observations(worker_indices, init=True), infos
+
+    def get_observations_selected(self, worker_indices):
+        worker_indices, _ = self._selected_states(
+            worker_indices, operation="get_observations_selected"
+        )
+        return self._selected_observations(worker_indices)
+
+    def get_tasks_selected(self, worker_indices):
+        worker_indices, _ = self._selected_states(
+            worker_indices, operation="get_tasks_selected"
+        )
+        return [self._bace_slots[index]['task'] for index in worker_indices]
+
+    def replay_selected(self, worker_indices, requests):
+        worker_indices = self._selected_indices(worker_indices, operation="replay_selected")
+        if len(worker_indices) != len(requests):
+            raise ValueError("worker_indices must match replay requests")
+        session_ids = [int(request.environment_reset_key) for request in requests]
+        prefixes = [list(request.parsed_action_prefix) for request in requests]
+        raw_obs, dones, infos, raw_available = self.envs.replay_selected(
+            worker_indices, session_ids, prefixes
+        )
+        for index, request, observation, done, info, available in zip(
+            worker_indices, requests, raw_obs, dones, infos, raw_available
+        ):
+            if len(request.prefix_observations) != len(request.parsed_action_prefix):
+                raise ValueError("Each replay action requires its pre-action observation")
+            if int(info.get('session_idx')) != int(request.environment_reset_key):
+                raise RuntimeError(
+                    "WebShop selected replay restored a different session: "
+                    f"worker={index}, expected={request.environment_reset_key}, "
+                    f"actual={info.get('session_idx')}"
+                )
+            task = request.task_description
+            info['session_idx'] = int(request.environment_reset_key)
+            info['available_actions'] = available
+            self._bace_slots[index] = {
+                'text_obs': self._format_one_obs(observation, task),
+                'task': task,
+                'session_idx': int(request.environment_reset_key),
+                'admissible_actions': tuple(self.format_avail_actions(available)),
+                'history': [
+                    {'text_obs': pre_obs, 'action': action}
+                    for pre_obs, action in zip(
+                        request.prefix_observations, request.parsed_action_prefix
+                    )
+                ],
+                'done': bool(done),
+            }
+        return self._selected_observations(worker_indices), np.asarray(dones, dtype=bool), infos
+
+    def step_selected(self, worker_indices, text_actions):
+        worker_indices, states = self._selected_states(
+            worker_indices, operation="step_selected"
+        )
+        if len(worker_indices) != len(text_actions):
+            raise ValueError("worker_indices must match text_actions")
+        actions, format_valids = self.projection_f(text_actions)
+        environment_valids = [
+            bool(valid) and self.is_action_executable(action, state['admissible_actions'])
+            for action, valid, state in zip(actions, format_valids, states)
+        ]
+        raw_obs, rewards, dones, infos = self.envs.step_selected(worker_indices, actions)
+        for state, observation, action, done, info, raw, format_valid, env_valid in zip(
+            states, raw_obs, actions, dones, infos, text_actions, format_valids,
+            environment_valids,
+        ):
+            if info.get('session_idx') is not None and int(info['session_idx']) != state['session_idx']:
+                raise RuntimeError(
+                    "WebShop selected step crossed logical sessions: "
+                    f"expected={state['session_idx']}, actual={info.get('session_idx')}"
+                )
+            state['history'].append({'text_obs': state['text_obs'], 'action': action})
+            state['text_obs'] = self._format_one_obs(observation, state['task'])
+            state['admissible_actions'] = tuple(
+                self.format_avail_actions(info['available_actions'])
+            )
+            state['done'] = bool(done)
+            if info.get('session_idx') is None:
+                info['session_idx'] = state['session_idx']
+            info['is_action_valid'] = to_numpy(format_valid)
+            info['is_action_format_valid'] = to_numpy(format_valid)
+            info['is_action_environment_valid'] = to_numpy(env_valid)
+            info['projected_action'] = action
+            info['action_identity'] = webshop_action_identity(
+                raw, action, bool(format_valid), env_valid
+            )
+        return (
+            self._selected_observations(worker_indices),
+            to_numpy(rewards),
+            to_numpy(dones),
+            infos,
+        )
     
     def reset(self, kwargs) -> Dict[str, Any]:
         staged = kwargs if isinstance(kwargs, dict) and '_bace_worker_indices' in kwargs else None
@@ -640,6 +861,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                         }
         self.pre_text_obs = obs
         self.memory.reset(batch_size = len(infos))
+        self._last_infos = infos
         return observations, infos
 
     def replay(self, requests):
@@ -675,10 +897,15 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             'anchor': obs.copy(),
             'admissible_actions': admissible_actions,
         }
+        self._last_infos = infos
         return observations, np.asarray(dones, dtype=bool), infos
 
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions)
+        action_pools = [
+            self.format_avail_actions(info['available_actions'])
+            for info in getattr(self, '_last_infos', [])
+        ]
         next_obs, rewards, dones, infos = self.envs.step(actions)
 
         next_obs = self.format_obs(next_obs)
@@ -695,9 +922,23 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             ],
         }
         # add action_valid to infos
+        # The pre-step action set is the one against which executability must
+        # be checked. Fall back to the manager's most recent reset/step infos.
+        if len(action_pools) != len(actions):
+            action_pools = [()] * len(actions)
         for i, info in enumerate(infos):
+            environment_valid = bool(valids[i]) and self.is_action_executable(
+                actions[i], action_pools[i]
+            )
             info['is_action_valid'] = to_numpy(valids[i])
+            info['is_action_format_valid'] = to_numpy(valids[i])
+            info['is_action_environment_valid'] = to_numpy(environment_valid)
             info['projected_action'] = actions[i]
+            info['action_identity'] = webshop_action_identity(
+                text_actions[i], actions[i], bool(valids[i]), environment_valid
+            )
+
+        self._last_infos = infos
 
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)

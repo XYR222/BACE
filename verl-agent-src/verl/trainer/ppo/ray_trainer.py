@@ -410,6 +410,7 @@ def compute_advantage(
     elif adv_estimator == AdvantageEstimator.BACE_GiGPO:
         from recipe.bace_gigpo.advantage import (
             compute_bace_gigpo_advantage,
+            compute_bace_tree_credit_advantage,
             compute_credit_diagnostics,
             resolve_action_ids,
         )
@@ -420,21 +421,70 @@ def compute_advantage(
             len(data),
         )
 
-        advantages, returns, components = compute_bace_gigpo_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            step_rewards=data.batch["step_rewards"],
-            response_mask=data.batch["response_mask"],
-            anchor_obs=data.non_tensor_batch["anchor_obs"],
-            task_ids=data.non_tensor_batch["uid"],
-            traj_ids=data.non_tensor_batch["traj_uid"],
-            action_ids=action_ids,
-            step_advantage_w=step_advantage_w,
-            mode=gigpo_mode,
-            enable_similarity=gigpo_enable_similarity,
-            similarity_thresh=gigpo_similarity_thresh,
-            compute_mean_std_cross_steps=gigpo_compute_mean_std_cross_steps,
-            local_credit_mode=kwargs.get("bace_local_credit_mode", "occurrence"),
+        tree_credit_mode = kwargs.get("bace_tree_credit_mode", "current")
+        macro_normalization_mode = kwargs.get(
+            "bace_macro_normalization_mode", "stable_occurrence"
         )
+        if tree_credit_mode == "current":
+            advantages, returns, components = compute_bace_gigpo_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                step_rewards=data.batch["step_rewards"],
+                response_mask=data.batch["response_mask"],
+                anchor_obs=data.non_tensor_batch["anchor_obs"],
+                task_ids=data.non_tensor_batch["uid"],
+                traj_ids=data.non_tensor_batch["traj_uid"],
+                action_ids=action_ids,
+                step_advantage_w=step_advantage_w,
+                mode=gigpo_mode,
+                enable_similarity=gigpo_enable_similarity,
+                similarity_thresh=gigpo_similarity_thresh,
+                compute_mean_std_cross_steps=gigpo_compute_mean_std_cross_steps,
+                local_credit_mode=kwargs.get("bace_local_credit_mode", "occurrence"),
+            )
+        else:
+            if kwargs.get("bace_local_credit_mode", "occurrence") != "occurrence":
+                raise ValueError("C1/C2/C3 require local_credit_mode=occurrence")
+            advantages, returns, components = compute_bace_tree_credit_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                step_rewards=data.batch["step_rewards"],
+                response_mask=data.batch["response_mask"],
+                anchor_obs=data.non_tensor_batch["anchor_obs"],
+                task_ids=data.non_tensor_batch["uid"],
+                traj_ids=data.non_tensor_batch["traj_uid"],
+                occurrence_ids=data.non_tensor_batch.get("occurrence_id"),
+                source_types=data.non_tensor_batch.get("source_type"),
+                leaf_ids=data.non_tensor_batch.get("leaf_id"),
+                step_indices=data.non_tensor_batch.get("step_index"),
+                raw_rewards=data.non_tensor_batch.get("rewards"),
+                episode_rewards=data.non_tensor_batch.get("episode_rewards"),
+                tree_origin_occurrence_ids=data.non_tensor_batch.get(
+                    "tree_origin_occurrence_id"
+                ),
+                tree_parent_root_ids=data.non_tensor_batch.get("tree_parent_root_id"),
+                adjustment_padding_mask=data.non_tensor_batch.get(
+                    "_adjust_batch_padding"
+                ),
+                tree_credit_mode=tree_credit_mode,
+                macro_normalization_mode=macro_normalization_mode,
+                gamma=gamma,
+                step_advantage_w=step_advantage_w,
+                mode=gigpo_mode,
+                enable_similarity=gigpo_enable_similarity,
+                similarity_thresh=gigpo_similarity_thresh,
+                compute_mean_std_cross_steps=gigpo_compute_mean_std_cross_steps,
+            )
+            keep_indices = components.pop("keep_indices")
+            tree_metadata = components.pop("metadata")
+            tree_diagnostics = components.pop("tree_diagnostics")
+            tree_branch_evidence = components.pop("branch_evidence")
+            data = data.select_idxs(keep_indices)
+            data.non_tensor_batch.update(tree_metadata)
+            data.meta_info["tree_credit_diagnostics"] = tree_diagnostics
+            data.meta_info["tree_credit_branch_evidence"] = tree_branch_evidence
+            data.meta_info["global_token_num"] = torch.sum(
+                data.batch["attention_mask"], dim=-1
+            ).tolist()
+            action_ids = action_ids[keep_indices]
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
         data.non_tensor_batch["bace_macro_advantage"] = components["macro"].detach().cpu().numpy()
@@ -454,6 +504,35 @@ def compute_advantage(
             similarity_thresh=gigpo_similarity_thresh,
             source_types=data.non_tensor_batch.get("source_type"),
         )
+        if tree_credit_mode != "current":
+            world_size = int(kwargs.get("bace_ppo_world_size", 1))
+            if world_size < 1:
+                raise ValueError("bace_ppo_world_size must be positive")
+            remainder = len(data) % world_size
+            padding_count = 0 if remainder == 0 else world_size - remainder
+            if padding_count:
+                pad_indices = np.resize(np.arange(len(data), dtype=np.int64), padding_count)
+                padding = data.select_idxs(pad_indices)
+                data = DataProto.concat([data, padding])
+                padding_slice = slice(len(data) - padding_count, len(data))
+                for key in ("advantages", "returns", "response_mask"):
+                    if key in data.batch:
+                        data.batch[key][padding_slice] = 0
+                if "loss_mask" in data.batch:
+                    data.batch["loss_mask"][padding_slice] = 0
+                sources = data.non_tensor_batch["source_type"].copy()
+                sources[padding_slice] = "ppo_padding"
+                data.non_tensor_batch["source_type"] = sources
+                edge_ids = data.non_tensor_batch["bace_edge_id"].copy()
+                for offset in range(padding_count):
+                    edge_ids[len(data) - padding_count + offset] = f"ppo-padding-{offset}"
+                data.non_tensor_batch["bace_edge_id"] = edge_ids
+            data.meta_info["tree_credit_diagnostics"][
+                "tree_credit_ppo_padding_rows"
+            ] = float(padding_count)
+            data.meta_info["global_token_num"] = torch.sum(
+                data.batch["attention_mask"], dim=-1
+            ).tolist()
     else:
         raise NotImplementedError
     return data
@@ -1467,7 +1546,22 @@ class RayPPOTrainer:
                                 "local_credit_mode", "occurrence"
                             ),
                             bace_local_credit_mode=self.config.algorithm.bace.local_credit_mode,
+                            bace_tree_credit_mode=self.config.algorithm.bace.get(
+                                "tree_credit_mode", "current"
+                            ),
+                            bace_macro_normalization_mode=self.config.algorithm.bace.get(
+                                "macro_normalization_mode", "stable_occurrence"
+                            ),
+                            bace_ppo_world_size=self.actor_rollout_wg.world_size,
                         )
+                        tree_credit_diagnostics = batch.meta_info.pop(
+                            "tree_credit_diagnostics", None
+                        )
+                        if tree_credit_diagnostics:
+                            metrics.update({
+                                f"credit/{key}": value
+                                for key, value in tree_credit_diagnostics.items()
+                            })
                         credit_diagnostics = batch.meta_info.pop("credit_diagnostics", None)
                         if credit_diagnostics:
                             metrics.update(

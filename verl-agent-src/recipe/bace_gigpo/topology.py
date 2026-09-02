@@ -288,12 +288,16 @@ class ExactBatchTopologyPlanner:
         seed: int = 0,
         invalid_action_mode: str = "strict_identity",
         tie_break_identity_mode: str = "legacy_uuid",
+        capacity_correction_batch_size: int = 1,
     ):
         if not 1 <= min_natural_roots <= total_budget:
             raise ValueError("min_natural_roots must be in [1, total_budget]")
         self.history = history
         self.total_budget = int(total_budget)
         self.min_natural_roots = int(min_natural_roots)
+        self.capacity_correction_batch_size = int(capacity_correction_batch_size)
+        if self.capacity_correction_batch_size < 1:
+            raise ValueError("capacity_correction_batch_size must be positive")
         self.competence_threshold = float(competence_threshold)
         self.local_prior_strength = float(local_prior_strength)
         self.invalid_action_mode = invalid_action_mode
@@ -368,7 +372,13 @@ class ExactBatchTopologyPlanner:
         collected_roots: list[RootEventLog],
         states: dict[str, ExactBatchTaskState],
     ) -> set[str]:
-        """Assess exact marginal capacity and convert at most one slot per task."""
+        """Assess exact capacity and convert a bounded batch of slots per task.
+
+        The default batch size of one preserves the historical protocol.  A
+        larger batch reduces root-generation waves by converting up to that
+        many *remaining* branch slots at once; it never exceeds the fixed
+        terminal leaf budget.
+        """
         roots_by_task: dict[str, list[RootEventLog]] = {}
         for root in collected_roots:
             roots_by_task.setdefault(root.task_id, []).append(root)
@@ -388,11 +398,12 @@ class ExactBatchTopologyPlanner:
                 state.initial_normalized_quota_deficit = (
                     state.initial_quota_deficit
                     / max(state.planned_branch_count, 1)
-                )
+            )
             if state.branch_count > 0 and state.information_capacity < state.branch_count:
-                state.root_count += 1
-                state.branch_count -= 1
-                state.correction_count += 1
+                converted = min(self.capacity_correction_batch_size, state.branch_count)
+                state.root_count += converted
+                state.branch_count -= converted
+                state.correction_count += converted
                 need_more_roots.add(task_id)
             if state.root_count + state.branch_count != self.total_budget:
                 raise AssertionError("Exact capacity correction violated the leaf budget")

@@ -274,6 +274,11 @@ algorithm:
     total_leaf_budget: 8
     pilot_roots: 2
     min_natural_roots: 2  # BatchERV Exact only; no pilot phase
+    # Exact Batch-ERV only: when a task's root evidence cannot support its
+    # frozen branch quota, convert this many remaining branch slots to root
+    # slots in one packed capacity-correction wave.  The conversion is capped
+    # by the remaining branch quota, so every task still has R + Q = B.
+    capacity_correction_batch_size: 1
     checkpoint_migration:
       enabled: false  # diagnostic-only; strict signature matching remains the default
       mode: strict  # strict | diagnostic_rmin2_to4 | pairwise_from_full
@@ -298,6 +303,8 @@ algorithm:
       batch_size: 2  # fixed at K=2 in the first Pairwise implementation
     local_prior_strength: 2.0
     local_credit_mode: occurrence  # occurrence | action_mean
+    tree_credit_mode: current  # current | o1_local | o1_tree_macro | o1_full_tree
+    macro_normalization_mode: stable_occurrence  # strict_leaf_uniform is reserved for a separate ablation
     invalid_action_mode: strict_identity  # strict_identity | valid_only_branch | single_invalid_bucket
     tie_break_identity_mode: legacy_uuid  # legacy_uuid preserves active runs; stable_v1 is deterministic across UUID changes
     artifacts:
