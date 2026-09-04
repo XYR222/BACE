@@ -4,6 +4,7 @@ import torch
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import (
     AdvantageEstimator,
+    _pad_tree_credit_ppo_batch,
     apply_invalid_action_penalty,
     compute_advantage,
 )
@@ -138,7 +139,7 @@ def test_trainer_bace_macro_reads_invalid_penalty_from_token_rewards():
     assert np.allclose(batch.non_tensor_batch["bace_macro_advantage"], expected, atol=1e-5)
 
 
-def test_trainer_tree_credit_filters_copied_origin_before_ppo():
+def _tree_batch():
     batch = DataProto.from_single_dict(data={
         "attention_mask": torch.ones((4, 2), dtype=torch.long),
         "token_level_rewards": torch.tensor([[0.0], [1.0], [0.0], [1.0]]),
@@ -159,8 +160,12 @@ def test_trainer_tree_credit_filters_copied_origin_before_ppo():
         "action_identity": np.array(["a", "b", "a", "c"], dtype=object),
         "projected_action": np.array(["a", "b", "a", "c"], dtype=object),
     })
+    return batch
+
+
+def test_trainer_tree_credit_filters_copied_origin_before_zero_loss_ppo_padding():
     result = compute_advantage(
-        batch,
+        _tree_batch(),
         adv_estimator=AdvantageEstimator.BACE_GiGPO,
         step_advantage_w=1.0,
         gamma=1.0,
@@ -168,6 +173,8 @@ def test_trainer_tree_credit_filters_copied_origin_before_ppo():
         bace_tree_credit_mode="o1_local",
         bace_macro_normalization_mode="stable_occurrence",
         bace_ppo_world_size=2,
+        bace_ppo_micro_batch_size_per_gpu=1,
+        bace_tree_ppo_padding_mode="zero_loss",
     )
     assert len(result) == 4
     assert result.non_tensor_batch["source_type"].tolist() == [
@@ -182,3 +189,80 @@ def test_trainer_tree_credit_filters_copied_origin_before_ppo():
     assert result.meta_info["tree_credit_diagnostics"][
         "tree_credit_copied_origins_removed"
     ] == 1.0
+
+
+def test_trainer_tree_credit_copy_padding_is_trainable_and_marked():
+    state = np.random.get_state()
+    np.random.seed(7)
+    try:
+        result = compute_advantage(
+            _tree_batch(),
+            adv_estimator=AdvantageEstimator.BACE_GiGPO,
+            step_advantage_w=1.0,
+            gamma=1.0,
+            gigpo_mode="mean_norm",
+            bace_tree_credit_mode="o1_local",
+            bace_macro_normalization_mode="stable_occurrence",
+            bace_ppo_world_size=2,
+            bace_ppo_micro_batch_size_per_gpu=2,
+            bace_tree_ppo_padding_mode="copy_trainable",
+        )
+    finally:
+        np.random.set_state(state)
+
+    assert len(result) == 4
+    assert "branch_origin" not in result.non_tensor_batch["source_type"]
+    assert result.non_tensor_batch["bace_ppo_is_padding_copy"].tolist() == [
+        False, False, False, True
+    ]
+    source_row = int(result.non_tensor_batch["bace_ppo_copy_source_row"][-1])
+    assert 0 <= source_row < 3
+    assert result.non_tensor_batch["bace_ppo_copy_of_edge_id"][-1] == (
+        result.non_tensor_batch["bace_edge_id"][source_row]
+    )
+    assert torch.equal(
+        result.batch["advantages"][-1], result.batch["advantages"][source_row]
+    )
+    assert result.batch["response_mask"][-1].any()
+    assert result.batch["loss_mask"][-1].any()
+    diagnostics = result.meta_info["tree_credit_diagnostics"]
+    assert diagnostics["tree_credit_ppo_size_divisor"] == 4.0
+    assert diagnostics["tree_credit_ppo_trainable_copy_rows"] == 1.0
+    assert diagnostics["tree_credit_ppo_zero_loss_rows"] == 0.0
+
+
+def test_tree_credit_copy_padding_matches_formal_two_gpu_micro_batch_divisor():
+    size = 198
+    data = DataProto.from_single_dict(data={
+        "attention_mask": torch.ones((size, 2), dtype=torch.long),
+        "response_mask": torch.ones((size, 1)),
+        "loss_mask": torch.ones((size, 2)),
+        "advantages": torch.arange(size, dtype=torch.float32).unsqueeze(-1),
+        "returns": torch.arange(size, dtype=torch.float32).unsqueeze(-1),
+        "source_type": np.array(["root"] * size, dtype=object),
+        "bace_edge_id": np.array([f"edge-{i}" for i in range(size)], dtype=object),
+    })
+    state = np.random.get_state()
+    np.random.seed(11)
+    try:
+        result, diagnostics = _pad_tree_credit_ppo_batch(
+            data,
+            world_size=2,
+            micro_batch_size_per_gpu=32,
+            mode="copy_trainable",
+        )
+    finally:
+        np.random.set_state(state)
+
+    assert len(result) == 256
+    assert len(result) % (2 * 32) == 0
+    assert (len(result) // 2) % 32 == 0
+    assert result.non_tensor_batch["bace_ppo_is_padding_copy"].sum() == 58
+    assert result.batch["response_mask"][198:].all()
+    assert result.batch["loss_mask"][198:].all()
+    assert diagnostics["tree_credit_ppo_trainable_copy_rows"] == 58.0
+    for row in range(198, 256):
+        source_row = int(result.non_tensor_batch["bace_ppo_copy_source_row"][row])
+        assert torch.equal(
+            result.batch["advantages"][row], result.batch["advantages"][source_row]
+        )

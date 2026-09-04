@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=bace_c123_smoke
-#SBATCH --partition=c23g
-#SBATCH --account=rwth2082
+#SBATCH --partition=c25g
+#SBATCH --account=rwth2089
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
@@ -15,6 +15,9 @@ set -euo pipefail
 
 SCRIPT_DIR=/hpcwork/xsz96350/fu_project/work-BACE/verl-agent-src/examples/bace_gigpo
 source "${SCRIPT_DIR}/h100_job_env.sh"
+# `run_alfworld_h100.sh` may invoke nested shell helpers.  Keep the repository
+# importable for the post-training validator regardless of their working dir.
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 export BACE_EXP_ROOT=/hpcwork/xsz96350/fu_project/work-BACE/experiments/alfworld-qwen2.5-1.5b-exact
 export TRAIN_DATA_SIZE=2
@@ -51,9 +54,10 @@ run_mode() {
         algorithm.bace.root_active_executor=true \
         algorithm.bace.history_initial_mean=0.60 \
         algorithm.bace.tree_credit_mode="${mode}" \
-        algorithm.bace.macro_normalization_mode=stable_occurrence
+        algorithm.bace.macro_normalization_mode=stable_occurrence \
+        algorithm.bace.tree_ppo_padding_mode=copy_trainable
 
-    python "${SCRIPT_DIR}/validate_tree_credit_smoke.py" \
+    "${ENV_PREFIX}/bin/python" "${SCRIPT_DIR}/validate_tree_credit_smoke.py" \
         "${BACE_ARTIFACT_DIR}" --mode "${mode}" \
         --output "${BACE_EXP_ROOT}/trace_validation/${run_name}/${invocation}_tree.json"
 }

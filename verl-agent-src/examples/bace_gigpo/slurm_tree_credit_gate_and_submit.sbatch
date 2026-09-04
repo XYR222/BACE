@@ -19,12 +19,13 @@ module load GCCcore/13.3.0
 source /home/xsz96350/miniforge3/etc/profile.d/conda.sh
 conda activate /hpcwork/xsz96350/fu_project/verl-agent
 export PYTHONNOUSERSITE=1
+export PYTHONPATH="/hpcwork/xsz96350/fu_project/work-BACE/verl-agent-src${PYTHONPATH:+:${PYTHONPATH}}"
 
 for mode in o1_local o1_tree_macro o1_full_tree; do
     run_name="tree_credit_${mode}_smoke_seed0_${SMOKE_JOB_ID}"
     artifact_dir="${EXP_ROOT}/bace_artifacts/${run_name}"
     report="${EXP_ROOT}/trace_validation/${run_name}/${SMOKE_JOB_ID}_${mode}_gate_recheck.json"
-    python "${SCRIPT_DIR}/validate_tree_credit_smoke.py" \
+    /hpcwork/xsz96350/fu_project/verl-agent/bin/python "${SCRIPT_DIR}/validate_tree_credit_smoke.py" \
         "${artifact_dir}" --mode "${mode}" --output "${report}"
 done
 

@@ -35,6 +35,11 @@ PYTHON_BIN=${WEBSHOP_ENV}/bin/python
 SMOKE_MAX_STEPS=${SMOKE_MAX_STEPS:-8}
 SMOKE_TEMPERATURE=${SMOKE_TEMPERATURE:-0.4}
 SMOKE_RESPONSE_LENGTH=${SMOKE_RESPONSE_LENGTH:-256}
+# Defaults are the 2-GPU gate.  A temporary one-GPU allocation supplies
+# BACE_SMOKE_GPUS=1 (and normally BACE_SMOKE_CPUS=16) at submission time.
+SMOKE_GPUS=${BACE_SMOKE_GPUS:-2}
+SMOKE_CPUS=${BACE_SMOKE_CPUS:-32}
+export SMOKE_GPUS SMOKE_CPUS
 
 module purge
 module load GCCcore/13.3.0
@@ -139,7 +144,7 @@ ppo_command=(
     actor_rollout_ref.actor.fsdp_config.param_offload=false
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=false
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
-    actor_rollout_ref.rollout.tensor_model_parallel_size=2
+    actor_rollout_ref.rollout.tensor_model_parallel_size="${SMOKE_GPUS}"
     actor_rollout_ref.rollout.name=vllm
     # Smoke-only sampling control: WebShop free-form search strings otherwise
     # make every root diverge immediately, leaving no repeated post-search
@@ -179,7 +184,7 @@ ppo_command=(
     trainer.project_name=verl_agent_webshop_bace_smoke
     trainer.experiment_name="${RUN_NAME}"
     trainer.device=cuda
-    trainer.n_gpus_per_node=2
+    trainer.n_gpus_per_node="${SMOKE_GPUS}"
     trainer.nnodes=1
     trainer.save_freq=-1
     trainer.test_freq=-1
@@ -190,7 +195,7 @@ ppo_command=(
     trainer.default_local_dir="${RUN_ROOT}/checkpoints_disabled"
     trainer.rollout_data_dir="${ROLLOUT_DIR}"
     trainer.resume_mode=disable
-    ray_init.num_cpus=32
+    ray_init.num_cpus="${SMOKE_CPUS}"
 )
 
 ppo_command+=("$@")
@@ -220,7 +225,7 @@ for name in modules:
     except Exception as exc:
         imports[name] = repr(exc)
 report = {
-    'ok': torch.cuda.is_available() and torch.cuda.device_count() == 2
+    'ok': torch.cuda.is_available() and torch.cuda.device_count() == int(os.environ['SMOKE_GPUS'])
           and all(value == 'ok' for value in imports.values()),
     'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
     'gpu_count': torch.cuda.device_count(),
@@ -278,7 +283,13 @@ if 'branch_main_pool_reuse' in metrics:
 if 'branch_selected_worker_execution' in metrics:
     assert float(metrics['branch_selected_worker_execution']) == 1.0
 roots = [json.loads(line) for line in (step / 'roots.jsonl').read_text().splitlines() if line]
-branches = [json.loads(line) for line in (step / 'branches.jsonl').read_text().splitlines() if line]
+branch_file = step / 'branches.jsonl'
+# No structural anchor means Exact capacity legitimately falls back to roots;
+# the artifact writer then omits (rather than writes) an empty branch file.
+branches = (
+    [json.loads(line) for line in branch_file.read_text().splitlines() if line]
+    if branch_file.exists() else []
+)
 assert roots
 assert all(int(row['environment_reset_key']) >= 500 for row in roots + branches)
 root_keys = {row['root_id']: str(row['environment_reset_key']) for row in roots}

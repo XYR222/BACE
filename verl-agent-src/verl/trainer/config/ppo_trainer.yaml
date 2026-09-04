@@ -305,6 +305,7 @@ algorithm:
     local_credit_mode: occurrence  # occurrence | action_mean
     tree_credit_mode: current  # current | o1_local | o1_tree_macro | o1_full_tree
     macro_normalization_mode: stable_occurrence  # strict_leaf_uniform is reserved for a separate ablation
+    tree_ppo_padding_mode: copy_trainable  # copy_trainable aligns C1/C2/C3 batching with upstream GiGPO/C0; zero_loss is retained as an ablation
     invalid_action_mode: strict_identity  # strict_identity | valid_only_branch | single_invalid_bucket
     tie_break_identity_mode: legacy_uuid  # legacy_uuid preserves active runs; stable_v1 is deterministic across UUID changes
     artifacts:
@@ -345,6 +346,7 @@ trainer:
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
   max_actor_ckpt_to_keep: null
   max_critic_ckpt_to_keep: null
+  max_global_ckpt_to_keep: null
   # Optional immutable hard-link snapshots, independent of normal retention.
   milestone_checkpoint_steps: []
   milestone_checkpoint_dir: null

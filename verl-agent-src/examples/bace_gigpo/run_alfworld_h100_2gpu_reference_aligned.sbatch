@@ -183,6 +183,7 @@ ppo_command=(
     algorithm.bace.local_credit_mode=occurrence
     algorithm.bace.tree_credit_mode="${TREE_CREDIT_MODE}"
     algorithm.bace.macro_normalization_mode="${MACRO_NORMALIZATION_MODE}"
+    algorithm.bace.tree_ppo_padding_mode=copy_trainable
     algorithm.bace.artifacts.enabled=true
     algorithm.bace.artifacts.directory="${ARTIFACT_DIR}"
     algorithm.bace.artifacts.include_token_arrays=true

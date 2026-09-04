@@ -3,6 +3,7 @@
 # or a fresh C1/C2 0--150 formal run.  The default phase is a 2--5 step smoke.
 # PAIRWISE_PHASE=continuation resumes the immutable step-100 checkpoint to 150;
 # PAIRWISE_PHASE=full starts a new C1 or C2 run at step 0 and runs to 150.
+# PAIRWISE_PHASE=gate starts a fresh, bounded C1/C2 validation run.
 # Submit one independent arm, for example:
 #   sbatch --export=ALL,PAIRWISE_ARM=c1 examples/bace_gigpo/slurm_pairwise_online_smoke_2gpu.sbatch
 # This launcher is self-contained: it does not invoke another training script.
@@ -32,9 +33,12 @@ PAIRWISE_ARM=${PAIRWISE_ARM:?Set PAIRWISE_ARM to c0, c1, or c2}
 PAIRWISE_PHASE=${PAIRWISE_PHASE:-smoke}
 MIN_NATURAL_ROOTS=${MIN_NATURAL_ROOTS:-2}
 CAPACITY_CORRECTION_BATCH_SIZE=${CAPACITY_CORRECTION_BATCH_SIZE:-1}
+HISTORY_INITIAL_MEAN=${HISTORY_INITIAL_MEAN:-0.10}
+HISTORY_INITIAL_STRENGTH=${HISTORY_INITIAL_STRENGTH:-2.0}
 SOURCE_STEP=${SOURCE_STEP:-100}
 SOURCE_CHECKPOINT=${SOURCE_CHECKPOINT:-${EXP_ROOT}/preserved_checkpoints/bace_alfworld_qwen2_5_1_5b_exact_2gpu_mem244_retry/global_step_${SOURCE_STEP}}
 TARGET_STEP=${TARGET_STEP:-}
+FRESH_RUN=false
 
 [[ "${SOURCE_STEP}" =~ ^[0-9]+$ ]]
 case "${PAIRWISE_PHASE}" in
@@ -65,20 +69,34 @@ case "${PAIRWISE_PHASE}" in
         MAX_CHECKPOINTS=2
         TEST_FREQ=5
         VALIDATE_ON_LAST_STEP=true
+        FRESH_RUN=true
+        ;;
+    gate)
+        # A fresh short run for exercising a changed collection schedule.
+        # Its run name and all outputs must remain isolated from formal arms.
+        TARGET_STEP=${TARGET_STEP:-1}
+        (( TARGET_STEP >= 1 && TARGET_STEP <= 3 ))
+        SAVE_FREQ=1
+        MAX_CHECKPOINTS=1
+        TEST_FREQ=-1
+        VALIDATE_ON_LAST_STEP=false
+        FRESH_RUN=true
         ;;
     *)
-        printf 'PAIRWISE_PHASE must be smoke, continuation, or full; got %s\n' "${PAIRWISE_PHASE}" >&2
+        printf 'PAIRWISE_PHASE must be smoke, continuation, full, or gate; got %s\n' "${PAIRWISE_PHASE}" >&2
         exit 2
         ;;
 esac
 [[ "${TARGET_STEP}" =~ ^[0-9]+$ ]]
 [[ "${MIN_NATURAL_ROOTS}" =~ ^[0-9]+$ ]] && (( MIN_NATURAL_ROOTS >= 1 && MIN_NATURAL_ROOTS <= 8 ))
 [[ "${CAPACITY_CORRECTION_BATCH_SIZE}" =~ ^[0-9]+$ ]] && (( CAPACITY_CORRECTION_BATCH_SIZE >= 1 ))
+[[ "${HISTORY_INITIAL_MEAN}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]
+[[ "${HISTORY_INITIAL_STRENGTH}" =~ ^[0-9]+(\.[0-9]+)?$ ]]
 
 case "${PAIRWISE_ARM}" in
     c0)
-        [[ "${PAIRWISE_PHASE}" != full ]] || {
-            printf 'PAIRWISE_PHASE=full is only defined for c1 or c2; c0 is the source full-BACE arm.\n' >&2
+        [[ "${FRESH_RUN}" != true ]] || {
+            printf 'Fresh pairwise phases are only defined for c1 or c2; c0 is the source full-BACE arm.\n' >&2
             exit 2
         }
         PAIRWISE_MODE=full
@@ -87,7 +105,7 @@ case "${PAIRWISE_ARM}" in
         ;;
     c1)
         PAIRWISE_MODE=fixed
-        if [[ "${PAIRWISE_PHASE}" == full ]]; then
+        if [[ "${FRESH_RUN}" == true ]]; then
             MIGRATION_ENABLED=false
             MIGRATION_MODE=strict
         else
@@ -97,7 +115,7 @@ case "${PAIRWISE_ARM}" in
         ;;
     c2)
         PAIRWISE_MODE=stopping
-        if [[ "${PAIRWISE_PHASE}" == full ]]; then
+        if [[ "${FRESH_RUN}" == true ]]; then
             MIGRATION_ENABLED=false
             MIGRATION_MODE=strict
         else
@@ -111,11 +129,15 @@ case "${PAIRWISE_ARM}" in
         ;;
 esac
 
-if [[ "${PAIRWISE_PHASE}" == full ]]; then
-    RUN_NAME=${BACE_RUN_NAME:-pairwise_${PAIRWISE_ARM}_tau005_full150_s3_seed0}
+# Accept RUN_NAME as a backwards-compatible alias for BACE_RUN_NAME.  This is
+# particularly useful for ad-hoc gates submitted through sbatch --export; all
+# derived output paths must refer to the same, fresh experiment directory.
+RUN_NAME_OVERRIDE=${BACE_RUN_NAME:-${RUN_NAME:-}}
+if [[ "${FRESH_RUN}" == true ]]; then
+    RUN_NAME=${RUN_NAME_OVERRIDE:-pairwise_${PAIRWISE_ARM}_tau005_full150_s3_seed0}
     INVOCATION_ID=${SLURM_JOB_ID:-local}_${PAIRWISE_ARM}_full_to${TARGET_STEP}
 else
-    RUN_NAME=${BACE_RUN_NAME:-pairwise_${PAIRWISE_ARM}_tau005_from${SOURCE_STEP}_${PAIRWISE_PHASE}_seed0}
+    RUN_NAME=${RUN_NAME_OVERRIDE:-pairwise_${PAIRWISE_ARM}_tau005_from${SOURCE_STEP}_${PAIRWISE_PHASE}_seed0}
     INVOCATION_ID=${SLURM_JOB_ID:-local}_${PAIRWISE_ARM}_from${SOURCE_STEP}_to${TARGET_STEP}
 fi
 ARTIFACT_DIR=${EXP_ROOT}/bace_artifacts/${RUN_NAME}
@@ -149,7 +171,7 @@ unset LOCAL_RANK LOCAL_WORLD_SIZE RANK WORLD_SIZE MASTER_ADDR MASTER_PORT
 for path in "${MODEL_PATH}" "${ALFWORLD_DATA}" "${TRAIN_FILE}" "${VAL_FILE}"; do
     [[ -e "${path}" ]] || { printf 'Missing required path: %s\n' "${path}" >&2; exit 2; }
 done
-if [[ "${PAIRWISE_PHASE}" != full ]]; then
+if [[ "${FRESH_RUN}" != true ]]; then
     for path in "${SOURCE_CHECKPOINT}/.complete" "${SOURCE_CHECKPOINT}/data.pt" \
         "${SOURCE_CHECKPOINT}/bace_collector_state.json"; do
         [[ -e "${path}" ]] || { printf 'Missing required source checkpoint path: %s\n' "${path}" >&2; exit 2; }
@@ -164,7 +186,7 @@ fi
 
 mkdir -p "${ARTIFACT_DIR}" "${CHECKPOINT_DIR}" "${ROLLOUT_DATA_DIR}" \
     "${TENSORBOARD_DIR}" "${METADATA_DIR}" "${REPORT_DIR}" "$(dirname "${LOG_FILE}")"
-if [[ "${PAIRWISE_PHASE}" != full ]]; then
+if [[ "${FRESH_RUN}" != true ]]; then
     find "${SOURCE_CHECKPOINT}" -maxdepth 3 -type f \
         -printf '%P\t%s\t%T@\n' | LC_ALL=C sort > "${METADATA_DIR}/source_checkpoint_before.tsv"
 fi
@@ -176,7 +198,7 @@ python3 "${WORKSPACE_ROOT}/work-BACE/deploy/gpu/check_gpu_environment.py" \
 nvidia-smi topo -m > "${METADATA_DIR}/gpu_topology.txt"
 python3 -m pip freeze > "${METADATA_DIR}/pip_freeze.txt"
 
-if [[ "${PAIRWISE_PHASE}" == full ]]; then
+if [[ "${FRESH_RUN}" == true ]]; then
     # A restarted allocation is allowed to resume only this run's own newest
     # checkpoint.  Prune first so an old process cannot leave an unbounded
     # checkpoint set for the new FSDP manager to rediscover.
@@ -187,7 +209,7 @@ if [[ "${PAIRWISE_PHASE}" == full ]]; then
     fi
 fi
 
-if [[ "${PAIRWISE_PHASE}" == full ]]; then
+if [[ "${FRESH_RUN}" == true ]]; then
     RESUME_ARGS=(
         trainer.resume_mode=auto
     )
@@ -215,8 +237,8 @@ ppo_command=(
     algorithm.bace.capacity_correction_batch_size="${CAPACITY_CORRECTION_BATCH_SIZE}"
     algorithm.bace.max_branches_per_anchor=2
     algorithm.bace.competence_threshold=0.5
-    algorithm.bace.history_initial_mean=0.10
-    algorithm.bace.history_initial_strength=2.0
+    algorithm.bace.history_initial_mean="${HISTORY_INITIAL_MEAN}"
+    algorithm.bace.history_initial_strength="${HISTORY_INITIAL_STRENGTH}"
     algorithm.bace.history_forgetting=0.8
     algorithm.bace.history_transfer_fraction=0.1
     algorithm.bace.history_min_strength=2.0
@@ -305,10 +327,11 @@ ppo_command=(
 
 printf '%q ' "${ppo_command[@]}" > "${METADATA_DIR}/resolved_command.sh"
 printf '\n' >> "${METADATA_DIR}/resolved_command.sh"
-printf 'arm=%s\nphase=%s\npairwise_mode=%s\nmin_natural_roots=%s\ncapacity_correction_batch_size=%s\nsource_checkpoint=%s\ntarget_step=%s\nscheduling_profile=P1-S(main_reuse+root_active_executor)\ncheckpoint_policy=save_every_%s_keep_latest_%s\n' \
+printf 'arm=%s\nphase=%s\npairwise_mode=%s\nmin_natural_roots=%s\ncapacity_correction_batch_size=%s\nhistory_initial_mean=%s\nhistory_initial_strength=%s\nsource_checkpoint=%s\ntarget_step=%s\nscheduling_profile=P1-S(main_reuse+root_active_executor)\ncheckpoint_policy=save_every_%s_keep_latest_%s\n' \
     "${PAIRWISE_ARM}" "${PAIRWISE_PHASE}" "${PAIRWISE_MODE}" \
     "${MIN_NATURAL_ROOTS}" "${CAPACITY_CORRECTION_BATCH_SIZE}" \
-    "$([[ "${PAIRWISE_PHASE}" == full ]] && printf 'fresh' || printf '%s' "${SOURCE_CHECKPOINT}")" \
+    "${HISTORY_INITIAL_MEAN}" "${HISTORY_INITIAL_STRENGTH}" \
+    "$([[ "${FRESH_RUN}" == true ]] && printf 'fresh' || printf '%s' "${SOURCE_CHECKPOINT}")" \
     "${TARGET_STEP}" "${SAVE_FREQ}" "${MAX_CHECKPOINTS}" > "${METADATA_DIR}/arm_contract.txt"
 (
     find recipe/bace_gigpo verl/trainer agent_system examples/bace_gigpo \
@@ -327,7 +350,7 @@ python3 -m recipe.bace_gigpo.validate_trace "${ARTIFACT_DIR}" \
     --output "${REPORT_DIR}/${INVOCATION_ID}_trace.json"
 python3 "${SCRIPT_DIR}/validate_pairwise_online_smoke.py" "${ARTIFACT_DIR}" \
     --arm "${PAIRWISE_ARM}" --output "${SMOKE_REPORT}"
-if [[ "${PAIRWISE_PHASE}" != full ]]; then
+if [[ "${FRESH_RUN}" != true ]]; then
     find "${SOURCE_CHECKPOINT}" -maxdepth 3 -type f \
         -printf '%P\t%s\t%T@\n' | LC_ALL=C sort > "${METADATA_DIR}/source_checkpoint_after.tsv"
     cmp "${METADATA_DIR}/source_checkpoint_before.tsv" "${METADATA_DIR}/source_checkpoint_after.tsv"

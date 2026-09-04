@@ -284,6 +284,51 @@ def test_training_diagnostics_tolerates_missing_optional_advantages(tmp_path):
     assert '"macro_advantage": null' in records[0]
 
 
+def test_training_diagnostics_separates_trainable_ppo_copies_from_unique_edges(tmp_path):
+    collector = object.__new__(BaceTrajectoryCollector)
+    collector.artifact_store = BaceArtifactStore(tmp_path, 1, {
+        "tree_credit_mode": "o1_local",
+        "macro_normalization_mode": "stable_occurrence",
+        "tree_ppo_padding_mode": "copy_trainable",
+    })
+    collector.config = SimpleNamespace(
+        algorithm=SimpleNamespace(
+            bace=SimpleNamespace(
+                artifacts={"include_token_arrays": False},
+            )
+        )
+    )
+    collector.trace_diagnostics = {}
+    collector.last_bace_metrics = {}
+    batch = DataProto.from_single_dict(data={
+        "responses": torch.zeros((2, 1), dtype=torch.long),
+        "response_mask": torch.ones((2, 1)),
+        "advantages": torch.tensor([[0.25], [0.25]]),
+        "source_type": np.asarray(["root", "root"], dtype=object),
+        "bace_edge_id": np.asarray(["edge-0", "edge-0"], dtype=object),
+        "bace_ppo_is_padding_copy": np.asarray([False, True]),
+        "bace_ppo_copy_of_edge_id": np.asarray([None, "edge-0"], dtype=object),
+        "bace_ppo_copy_source_row": np.asarray([-1, 0], dtype=np.int64),
+    })
+
+    collector.save_training_diagnostics(batch)
+
+    unique_records = (
+        collector.artifact_store.step_dir / "trainable_occurrences.jsonl"
+    ).read_text().splitlines()
+    copy_records = (
+        collector.artifact_store.step_dir / "ppo_training_copies.jsonl"
+    ).read_text().splitlines()
+    assert len(unique_records) == 1
+    assert len(copy_records) == 1
+    copy_record = json.loads(copy_records[0])
+    assert copy_record["copy_of_edge_id"] == "edge-0"
+    assert copy_record["copy_source_row"] == 0
+    assert collector.trace_diagnostics["tree_credit_ppo_trainable_copy_rows"] == 1
+    assert collector.trace_diagnostics["tree_credit_ppo_physical_rows"] == 2
+    assert collector.trace_diagnostics["tree_credit_unique_trainable_rows"] == 1
+
+
 def test_trace_validator_accepts_occurrence_level_gigpo_macro_values(tmp_path):
     store = BaceArtifactStore(tmp_path, 4, {"advantage_semantics": "gigpo_macro"})
     store.append("roots", {"root_id": "root-1"})

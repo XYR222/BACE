@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# One full-configuration BACE WebShop-1k PPO step on 2 x H100.
-# This is a gate only: it never submits a formal training job.
-#SBATCH --job-name=bace_ws_2g_formal_smoke
-#SBATCH --partition=c23g
-#SBATCH --account=rwth2082
+# Full 150-step Exact-Batch-ERV BACE WebShop-1k run on 2 x H100.
+# It is submitted only with an afterok dependency from the smoke gate.
+#SBATCH --job-name=bace_ws_2g_formal
+#SBATCH --partition=c25g
+#SBATCH --account=rwth2089
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=244G
 #SBATCH --gres=gpu:2
-#SBATCH --time=01:00:00
+#SBATCH --time=23:30:00
 #SBATCH --chdir=/hpcwork/xsz96350/fu_project/work-BACE/verl-agent-src
 #SBATCH --output=/hpcwork/xsz96350/fu_project/work-BACE/experiments/webshop1k-qwen2.5-1.5b-exact/slurm/%x-%j.out
 #SBATCH --error=/hpcwork/xsz96350/fu_project/work-BACE/experiments/webshop1k-qwen2.5-1.5b-exact/slurm/%x-%j.err
@@ -19,20 +19,29 @@ set -euo pipefail
 WORKSPACE_ROOT=/hpcwork/xsz96350/fu_project
 REPO_ROOT=${WORKSPACE_ROOT}/work-BACE/verl-agent-src
 SCRIPT_DIR=${REPO_ROOT}/examples/bace_gigpo
-WEBSHOP_ENV=${WORKSPACE_ROOT}/verl-agent-webshop
+WEBSHOP_ENV=/hpcwork/rwth2089/xsz96350/work-BACE/verl-agent-webshop
 MODEL_PATH=${WORKSPACE_ROOT}/model_down/model/Qwen2.5-1.5B-Instruct
 TRAIN_FILE=${WORKSPACE_ROOT}/data/text/train.parquet
 VAL_FILE=${WORKSPACE_ROOT}/data/text/test.parquet
 EXP_ROOT=${WORKSPACE_ROOT}/work-BACE/experiments/webshop1k-qwen2.5-1.5b-exact
-RUN_NAME=${BACE_RUN_NAME:-bace_webshop1k_exact_formal_smoke_${SLURM_JOB_ID:-dryrun}}
-INVOCATION_ID=${SLURM_JOB_ID:-dryrun}_2gpu_formal_smoke
-RUN_ROOT=${EXP_ROOT}/smoke/${RUN_NAME}
+RUN_NAME=${BACE_RUN_NAME:-bace_webshop1k_exact_2gpu_seed0}
+INVOCATION_ID=${SLURM_JOB_ID:-dryrun}_2gpu_formal
+RUN_ROOT=${EXP_ROOT}/runs/${RUN_NAME}
 ARTIFACT_DIR=${RUN_ROOT}/bace_artifacts
 ROLLOUT_DIR=${RUN_ROOT}/rollout_trajectories
 METADATA_DIR=${RUN_ROOT}/metadata
 REPORT_DIR=${RUN_ROOT}/trace_validation
 LOG_FILE=${RUN_ROOT}/training.log
+CHECKPOINT_DIR=${EXP_ROOT}/checkpoints/${RUN_NAME}
+TENSORBOARD_DIR=${EXP_ROOT}/tensorboard/${RUN_NAME}
+TOTAL_STEPS=${BACE_TOTAL_STEPS:-150}
+SAVE_FREQ=${BACE_SAVE_FREQ:-5}
+MAX_CHECKPOINTS=${BACE_MAX_CHECKPOINTS:-2}
 PYTHON_BIN=${WEBSHOP_ENV}/bin/python
+
+[[ "${TOTAL_STEPS}" =~ ^[1-9][0-9]*$ ]]
+[[ "${SAVE_FREQ}" =~ ^[1-9][0-9]*$ ]]
+[[ "${MAX_CHECKPOINTS}" =~ ^[12]$ ]]
 
 module purge
 module load GCCcore/13.3.0
@@ -59,6 +68,7 @@ export JAVA_TOOL_OPTIONS='-Xms64m -Xmx512m -Xss512k -XX:ActiveProcessorCount=1 -
 export OMP_NUM_THREADS=1 OMP_THREAD_LIMIT=1 MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 NUMEXPR_MAX_THREADS=1
 export RAYON_NUM_THREADS=1 MALLOC_ARENA_MAX=2
+export TENSORBOARD_DIR
 
 for required in "${REPO_ROOT}" "${WEBSHOP_ENV}" "${MODEL_PATH}" "${TRAIN_FILE}" "${VAL_FILE}" "${JVM_PATH}"; do
     [[ -e "${required}" ]] || { printf 'Missing required asset: %s\n' "${required}" >&2; exit 2; }
@@ -68,9 +78,34 @@ done
     exit 2
 }
 
-mkdir -p "${ARTIFACT_DIR}" "${ROLLOUT_DIR}" "${METADATA_DIR}" "${REPORT_DIR}" \
+mkdir -p "${ARTIFACT_DIR}" "${ROLLOUT_DIR}" "${METADATA_DIR}" "${REPORT_DIR}" "${CHECKPOINT_DIR}" "${TENSORBOARD_DIR}" \
     "$(dirname "${LOG_FILE}")" "${EXP_ROOT}/slurm"
 cd "${REPO_ROOT}"
+
+tracker=${CHECKPOINT_DIR}/latest_checkpointed_iteration.txt
+if [[ ${DRY_RUN:-0} != 1 && -f "${tracker}" ]]; then
+    # This is deliberately before model startup.  It recognizes checkpoints
+    # made by an earlier Slurm process and ensures enough space for the next
+    # complete write while keeping a 10-GiB filesystem reserve.
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/prune_checkpoints.py" "${CHECKPOINT_DIR}" \
+        --recommend --output "${METADATA_DIR}/checkpoint_retention_before.json"
+    MAX_CHECKPOINTS=$("${PYTHON_BIN}" - "${METADATA_DIR}/checkpoint_retention_before.json" <<'PY'
+import json, sys
+value = int(json.load(open(sys.argv[1]))['recommended_keep'])
+assert value in (1, 2)
+print(value)
+PY
+)
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/prune_checkpoints.py" "${CHECKPOINT_DIR}" \
+        --keep "${MAX_CHECKPOINTS}" --output "${METADATA_DIR}/checkpoint_prune_before.json"
+    latest_step=$(<"${tracker}")
+    if (( latest_step >= TOTAL_STEPS )); then
+        "${PYTHON_BIN}" -m recipe.bace_gigpo.validate_trace "${ARTIFACT_DIR}" \
+            --output "${REPORT_DIR}/${INVOCATION_ID}_already_complete.json"
+        printf 'Target step %s already complete; nothing to resume.\n' "${TOTAL_STEPS}"
+        exit 0
+    fi
+fi
 
 ppo_command=(
     "${PYTHON_BIN}" -m verl.trainer.main_ppo
@@ -129,7 +164,6 @@ ppo_command=(
     actor_rollout_ref.actor.use_kl_loss=True
     actor_rollout_ref.actor.kl_loss_coef=0.01
     actor_rollout_ref.actor.kl_loss_type=low_var_kl
-    actor_rollout_ref.actor.use_torch_compile=True
     actor_rollout_ref.model.enable_gradient_checkpointing=True
     actor_rollout_ref.actor.fsdp_config.param_offload=false
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=false
@@ -169,21 +203,23 @@ ppo_command=(
     env.resources_per_worker.num_cpus=0.1
 
     trainer.critic_warmup=0
-    "trainer.logger=['console']"
+    "trainer.logger=['console','tensorboard']"
     trainer.project_name=verl_agent_webshop_bace
     trainer.experiment_name="${RUN_NAME}"
     trainer.device=cuda
     trainer.n_gpus_per_node=2
     trainer.nnodes=1
-    trainer.save_freq=-1
-    trainer.test_freq=-1
-    trainer.total_epochs=1
-    trainer.total_training_steps=1
-    trainer.val_before_train=false
-    trainer.validate_on_last_step=false
-    trainer.default_local_dir="${RUN_ROOT}/checkpoints_disabled"
+    trainer.save_freq="${SAVE_FREQ}"
+    trainer.test_freq=5
+    trainer.total_epochs="${TOTAL_STEPS}"
+    trainer.total_training_steps="${TOTAL_STEPS}"
+    trainer.val_before_train=true
+    trainer.validate_on_last_step=true
+    trainer.default_local_dir="${CHECKPOINT_DIR}"
     trainer.rollout_data_dir="${ROLLOUT_DIR}"
-    trainer.resume_mode=disable
+    trainer.resume_mode=auto
+    trainer.max_actor_ckpt_to_keep="${MAX_CHECKPOINTS}"
+    trainer.max_global_ckpt_to_keep="${MAX_CHECKPOINTS}"
     ray_init.num_cpus=32
 )
 
@@ -246,14 +282,18 @@ printf 'train_exit_code=%s\nend_time=%s\n' "${train_status}" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${METADATA_DIR}/completion.txt"
 (( train_status == 0 )) || exit "${train_status}"
 
-grep -Eq "training/global_step['\"]?:[[:space:]]*1|training/global_step[^0-9]+1" "${LOG_FILE}"
+grep -Eq "training/global_step['\"]?:[[:space:]]*${TOTAL_STEPS}|training/global_step[^0-9]+${TOTAL_STEPS}" "${LOG_FILE}"
 ! grep -Eqi 'CUDA out of memory|OutOfMemoryError|RayTaskError|NCCL[^[:space:]]* error' "${LOG_FILE}"
 "${PYTHON_BIN}" -m recipe.bace_gigpo.validate_trace "${ARTIFACT_DIR}" \
     --output "${REPORT_DIR}/${INVOCATION_ID}_final.json"
-"${PYTHON_BIN}" - "${ARTIFACT_DIR}/step_00000001" <<'PY'
+"${PYTHON_BIN}" "${SCRIPT_DIR}/prune_checkpoints.py" "${CHECKPOINT_DIR}" \
+    --keep "${MAX_CHECKPOINTS}" --output "${METADATA_DIR}/checkpoint_prune_after.json"
+"${PYTHON_BIN}" - "${ARTIFACT_DIR}/step_$(printf '%08d' "${TOTAL_STEPS}")" "${CHECKPOINT_DIR}" "${TOTAL_STEPS}" <<'PY'
 import json, sys
 from pathlib import Path
 step = Path(sys.argv[1])
+checkpoint_dir = Path(sys.argv[2])
+total_steps = int(sys.argv[3])
 summary = json.loads((step / 'summary.json').read_text())
 manifest = json.loads((step / 'manifest.json').read_text())
 metrics = summary['bace_metrics']
@@ -265,10 +305,13 @@ assert float(metrics['batch_erv_exact']) == 1.0
 assert float(metrics['staged_root_batching_packed']) == 1.0
 assert float(metrics['root_active_executor_enabled']) == 1.0
 roots = [json.loads(line) for line in (step / 'roots.jsonl').read_text().splitlines() if line]
-branches = [json.loads(line) for line in (step / 'branches.jsonl').read_text().splitlines() if line]
+branch_file = step / 'branches.jsonl'
+branches = [json.loads(line) for line in branch_file.read_text().splitlines() if line] if branch_file.exists() else []
 assert roots
 assert all(int(row['environment_reset_key']) >= 500 for row in roots + branches)
-print('WebShop-1k formal-parameter Exact BACE smoke passed')
+assert (checkpoint_dir / 'latest_checkpointed_iteration.txt').read_text().strip() == str(total_steps)
+assert (checkpoint_dir / f'global_step_{total_steps}' / 'bace_collector_state.json').is_file()
+print('WebShop Exact BACE formal run passed')
 PY
 
-printf 'All full-parameter WebShop-1k smoke gates passed; no formal job was submitted.\n'
+printf 'All WebShop Exact BACE formal-run gates passed.\n'

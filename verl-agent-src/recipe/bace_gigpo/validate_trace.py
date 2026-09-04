@@ -229,6 +229,34 @@ def validate_step(step_dir: Path, max_recomputed_logprob_diff=None,
         edge_ids = [str(record.get("edge_id")) for record in occurrences]
         if len(edge_ids) != len(set(edge_ids)):
             errors.append("tree-credit PPO support contains duplicate concrete edge IDs")
+        tree_ppo_padding_mode = str(
+            manifest.get("tree_ppo_padding_mode", "zero_loss")
+        )
+        if tree_ppo_padding_mode not in {"copy_trainable", "zero_loss"}:
+            errors.append(
+                f"unknown tree-credit PPO padding mode: {tree_ppo_padding_mode}"
+            )
+        ppo_training_copies = streams.get("ppo_training_copies", [])
+        if tree_ppo_padding_mode == "zero_loss" and ppo_training_copies:
+            errors.append(
+                "zero-loss tree-credit run contains trainable PPO copies"
+            )
+        edge_id_set = set(edge_ids)
+        for copy_record in ppo_training_copies:
+            copied_edge = copy_record.get("copy_of_edge_id")
+            if copied_edge is None:
+                errors.append("trainable PPO copy lacks copy_of_edge_id")
+            elif str(copied_edge) not in edge_id_set:
+                errors.append(
+                    f"trainable PPO copy references unknown edge: {copied_edge}"
+                )
+            if str(copy_record.get("source_type")) not in {
+                "root", "branch_suffix"
+            }:
+                errors.append(
+                    "trainable PPO copy has unsupported source_type: "
+                    f"{copy_record.get('source_type')}"
+                )
         required_tree_fields = {
             "edge_id", "root_id", "step_index", "direct_leaf_ids",
             "descendant_leaf_ids", "num_direct_continuations",
@@ -286,7 +314,10 @@ def validate_step(step_dir: Path, max_recomputed_logprob_diff=None,
         checks["tree_credit"] = {
             "mode": tree_credit_mode,
             "macro_normalization_mode": macro_normalization_mode,
+            "ppo_padding_mode": tree_ppo_padding_mode,
             "unique_trainable_edges": len(edge_ids),
+            "trainable_ppo_copies": len(ppo_training_copies),
+            "physical_ppo_rows": len(edge_ids) + len(ppo_training_copies),
             "copied_origins_trainable": len(by_source.get("branch_origin", [])),
         }
         tree_branches = streams.get("tree_credit_branches", [])

@@ -743,3 +743,83 @@ def test_exact_capacity_correction_uses_the_shared_root_wave_executor(monkeypatc
     ] == 1.0
     assert collector.orchestration_metrics["planned_root_waves"] == 1.0
     assert "pilot_root_waves" not in collector.orchestration_metrics
+
+
+def test_exact_capacity_correction_packs_every_slot_after_two_slot_conversion(monkeypatch):
+    """A batch correction must generate both newly required root slots."""
+    collector = object.__new__(BaceTrajectoryCollector)
+    collector.config = SimpleNamespace(
+        algorithm=SimpleNamespace(bace=SimpleNamespace(total_leaf_budget=4))
+    )
+    collector.root_active_executor = True
+    collector.orchestration_metrics = {}
+    collector.artifact_store = None
+    collector.current_step = 8
+    waves = []
+
+    class FakeEnvs:
+        def reset(self, kwargs):
+            assert kwargs["_bace_worker_indices"] == [0, 4]
+            return None, [
+                {"extra.gamefile": "/data/pick_and_place/game-0"},
+                {"extra.gamefile": "/data/pick_and_place/game-1"},
+            ]
+
+    def collect_wave(
+        gen_batch, actor_rollout_wg, envs, task_indices, root_slots,
+        task_uids, reset_keys,
+    ):
+        del gen_batch, actor_rollout_wg, envs, reset_keys
+        wave = SimpleNamespace(
+            task_indices=list(task_indices),
+            root_slots=list(root_slots),
+            task_uids=[task_uids[index] for index in task_indices],
+        )
+        waves.append(wave)
+        return wave
+
+    def build_logs(wave):
+        return [
+            SimpleNamespace(task_id=task_id, root_id=f"{task_id}:{slot}")
+            for task_id, slot in zip(wave.task_uids, wave.root_slots)
+        ]
+
+    class FakePlanner:
+        def __init__(self):
+            self.calls = 0
+            self.first_task = None
+
+        def initialize(self, families):
+            task_ids = list(families)
+            self.first_task = task_ids[0]
+            return {
+                task_id: SimpleNamespace(root_count=2) for task_id in task_ids
+            }
+
+        def correct_capacity(self, logs, states):
+            self.calls += 1
+            if self.calls == 1:
+                states[self.first_task].root_count = 4
+                return {self.first_task}
+            assert len(logs) == 6
+            return set()
+
+        def finalize(self, logs, states):
+            del states
+            return SimpleNamespace(roots=tuple(logs))
+
+    collector._collect_root_wave = collect_wave
+    collector._concat_batches = lambda batches: tuple(batches)
+    collector.topology_planner = FakePlanner()
+    monkeypatch.setattr(collector_module, "build_root_event_logs", build_logs)
+
+    _, root_logs, _, generated = collector._collect_exact_batch_dynamic_roots_packed(
+        gen_batch=[object(), object()], actor_rollout_wg=None, envs=FakeEnvs()
+    )
+
+    assert [wave.root_slots for wave in waves] == [[0, 0, 1, 1], [2, 3]]
+    assert len(root_logs) == 6
+    assert sorted(generated.values()) == [2, 4]
+    assert collector.orchestration_metrics[
+        "capacity_correction_root_trajectories"
+    ] == 2.0

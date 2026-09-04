@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import shutil
 import uuid
 from collections import defaultdict
 from contextlib import contextmanager
@@ -65,6 +66,40 @@ from gigpo import core_gigpo
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 WorkerType = Type[Worker]
+
+
+def _rotate_global_checkpoint_directories(checkpoint_root: str, latest_step: int,
+                                          keep: int | None) -> list[str]:
+    """Bound complete global-step checkpoint trees across Slurm processes."""
+    if keep is None:
+        return []
+    keep = int(keep)
+    if keep < 1:
+        raise ValueError("trainer.max_global_ckpt_to_keep must be positive")
+    root = os.path.realpath(checkpoint_root)
+    entries = []
+    for name in os.listdir(root):
+        if not name.startswith("global_step_"):
+            continue
+        suffix = name.removeprefix("global_step_")
+        path = os.path.join(root, name)
+        if suffix.isdigit() and os.path.isdir(path):
+            entries.append((int(suffix), path))
+    entries.sort()
+    if latest_step not in {step for step, _ in entries}:
+        raise FileNotFoundError(
+            f"committed global_step_{latest_step} is missing under {root}"
+        )
+    retained = {step for step, _ in entries[-keep:]}
+    removed = []
+    for step, path in entries:
+        if step in retained:
+            continue
+        if os.path.realpath(os.path.dirname(path)) != root:
+            raise RuntimeError(f"refusing unsafe checkpoint rotation target: {path}")
+        shutil.rmtree(path)
+        removed.append(path)
+    return removed
 
 
 class Role(Enum):
@@ -240,6 +275,102 @@ def compute_response_mask(data: DataProto):
     response_length = responses.size(1)
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
+
+
+def _pad_tree_credit_ppo_batch(
+    data: DataProto,
+    *,
+    world_size: int,
+    micro_batch_size_per_gpu: int,
+    mode: str,
+) -> tuple[DataProto, dict[str, float]]:
+    """Restore actor micro-batch divisibility after unique-edge filtering.
+
+    ``copy_trainable`` deliberately matches upstream GiGPO/C0 batching: real
+    rows are sampled and copied with their loss intact.  The copies are marked
+    so artifacts can report physical PPO rows without treating them as new
+    logical edges.  ``zero_loss`` retains the earlier tree-credit behavior as
+    an explicit ablation.
+    """
+    world_size = int(world_size)
+    micro_batch_size_per_gpu = int(micro_batch_size_per_gpu)
+    if world_size < 1:
+        raise ValueError("bace_ppo_world_size must be positive")
+    if micro_batch_size_per_gpu < 1:
+        raise ValueError("bace_ppo_micro_batch_size_per_gpu must be positive")
+    if mode not in {"copy_trainable", "zero_loss"}:
+        raise ValueError(
+            "bace_tree_ppo_padding_mode must be copy_trainable or zero_loss"
+        )
+    if len(data) < 1:
+        raise ValueError("tree-credit PPO support cannot be empty")
+
+    size_divisor = world_size * micro_batch_size_per_gpu
+    remainder = len(data) % size_divisor
+    padding_count = 0 if remainder == 0 else size_divisor - remainder
+
+    data.non_tensor_batch["bace_ppo_is_padding_copy"] = np.zeros(
+        len(data), dtype=bool
+    )
+    data.non_tensor_batch["bace_ppo_copy_of_edge_id"] = np.full(
+        len(data), None, dtype=object
+    )
+    data.non_tensor_batch["bace_ppo_copy_source_row"] = np.full(
+        len(data), -1, dtype=np.int64
+    )
+
+    trainable_copy_count = 0
+    zero_loss_count = 0
+    if padding_count:
+        # Upstream adjust_batch samples without replacement.  Keep that exact
+        # behavior whenever the support is large enough; replacement is only
+        # needed for tiny synthetic/debug batches with fewer rows than padding.
+        pad_indices = np.random.choice(
+            len(data), padding_count, replace=padding_count > len(data)
+        ).astype(np.int64, copy=False)
+        padding = data.select_idxs(pad_indices)
+        original_size = len(data)
+        data = DataProto.concat([data, padding])
+        padding_slice = slice(original_size, len(data))
+
+        if mode == "copy_trainable":
+            flags = data.non_tensor_batch["bace_ppo_is_padding_copy"].copy()
+            flags[padding_slice] = True
+            data.non_tensor_batch["bace_ppo_is_padding_copy"] = flags
+
+            copied_edges = data.non_tensor_batch["bace_ppo_copy_of_edge_id"].copy()
+            source_edges = data.non_tensor_batch["bace_edge_id"]
+            copied_edges[padding_slice] = source_edges[pad_indices]
+            data.non_tensor_batch["bace_ppo_copy_of_edge_id"] = copied_edges
+
+            source_rows = data.non_tensor_batch["bace_ppo_copy_source_row"].copy()
+            source_rows[padding_slice] = pad_indices
+            data.non_tensor_batch["bace_ppo_copy_source_row"] = source_rows
+            trainable_copy_count = padding_count
+        else:
+            for key in ("advantages", "returns", "response_mask"):
+                if key in data.batch:
+                    data.batch[key][padding_slice] = 0
+            if "loss_mask" in data.batch:
+                data.batch["loss_mask"][padding_slice] = 0
+            sources = data.non_tensor_batch["source_type"].copy()
+            sources[padding_slice] = "ppo_padding"
+            data.non_tensor_batch["source_type"] = sources
+            edge_ids = data.non_tensor_batch["bace_edge_id"].copy()
+            for offset in range(padding_count):
+                edge_ids[original_size + offset] = f"ppo-padding-{offset}"
+            data.non_tensor_batch["bace_edge_id"] = edge_ids
+            zero_loss_count = padding_count
+
+    diagnostics = {
+        "tree_credit_ppo_padding_rows": float(padding_count),
+        "tree_credit_ppo_trainable_copy_rows": float(trainable_copy_count),
+        "tree_credit_ppo_zero_loss_rows": float(zero_loss_count),
+        "tree_credit_ppo_copy_trainable": float(mode == "copy_trainable"),
+        "tree_credit_ppo_size_divisor": float(size_divisor),
+        "tree_credit_ppo_physical_rows": float(len(data)),
+    }
+    return data, diagnostics
 
 
 def compute_advantage(
@@ -505,31 +636,19 @@ def compute_advantage(
             source_types=data.non_tensor_batch.get("source_type"),
         )
         if tree_credit_mode != "current":
-            world_size = int(kwargs.get("bace_ppo_world_size", 1))
-            if world_size < 1:
-                raise ValueError("bace_ppo_world_size must be positive")
-            remainder = len(data) % world_size
-            padding_count = 0 if remainder == 0 else world_size - remainder
-            if padding_count:
-                pad_indices = np.resize(np.arange(len(data), dtype=np.int64), padding_count)
-                padding = data.select_idxs(pad_indices)
-                data = DataProto.concat([data, padding])
-                padding_slice = slice(len(data) - padding_count, len(data))
-                for key in ("advantages", "returns", "response_mask"):
-                    if key in data.batch:
-                        data.batch[key][padding_slice] = 0
-                if "loss_mask" in data.batch:
-                    data.batch["loss_mask"][padding_slice] = 0
-                sources = data.non_tensor_batch["source_type"].copy()
-                sources[padding_slice] = "ppo_padding"
-                data.non_tensor_batch["source_type"] = sources
-                edge_ids = data.non_tensor_batch["bace_edge_id"].copy()
-                for offset in range(padding_count):
-                    edge_ids[len(data) - padding_count + offset] = f"ppo-padding-{offset}"
-                data.non_tensor_batch["bace_edge_id"] = edge_ids
-            data.meta_info["tree_credit_diagnostics"][
-                "tree_credit_ppo_padding_rows"
-            ] = float(padding_count)
+            data, ppo_padding_diagnostics = _pad_tree_credit_ppo_batch(
+                data,
+                world_size=kwargs.get("bace_ppo_world_size", 1),
+                micro_batch_size_per_gpu=kwargs.get(
+                    "bace_ppo_micro_batch_size_per_gpu", 1
+                ),
+                mode=kwargs.get(
+                    "bace_tree_ppo_padding_mode", "copy_trainable"
+                ),
+            )
+            data.meta_info["tree_credit_diagnostics"].update(
+                ppo_padding_diagnostics
+            )
             data.meta_info["global_token_num"] = torch.sum(
                 data.batch["attention_mask"], dim=-1
             ).tolist()
@@ -1153,6 +1272,13 @@ class RayPPOTrainer:
             f.flush()
             os.fsync(f.fileno())
         os.replace(temporary_tracker, local_latest_checkpointed_iteration)
+        removed = _rotate_global_checkpoint_directories(
+            self.config.trainer.default_local_dir,
+            self.global_steps,
+            self.config.trainer.get("max_global_ckpt_to_keep", None),
+        )
+        if removed:
+            print(f"Rotated committed global checkpoints: {removed}")
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -1553,6 +1679,12 @@ class RayPPOTrainer:
                                 "macro_normalization_mode", "stable_occurrence"
                             ),
                             bace_ppo_world_size=self.actor_rollout_wg.world_size,
+                            bace_ppo_micro_batch_size_per_gpu=(
+                                self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
+                            ),
+                            bace_tree_ppo_padding_mode=self.config.algorithm.bace.get(
+                                "tree_ppo_padding_mode", "copy_trainable"
+                            ),
                         )
                         tree_credit_diagnostics = batch.meta_info.pop(
                             "tree_credit_diagnostics", None

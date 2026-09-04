@@ -65,6 +65,9 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         self.macro_normalization_mode = str(
             bace_config.get("macro_normalization_mode", "stable_occurrence")
         )
+        self.tree_ppo_padding_mode = str(
+            bace_config.get("tree_ppo_padding_mode", "copy_trainable")
+        )
         if self.tree_credit_mode not in {
             "current", "o1_local", "o1_tree_macro", "o1_full_tree"
         }:
@@ -76,6 +79,11 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             raise ValueError(
                 "C0/C1/C2/C3 currently require "
                 "algorithm.bace.macro_normalization_mode=stable_occurrence"
+            )
+        if self.tree_ppo_padding_mode not in {"copy_trainable", "zero_loss"}:
+            raise ValueError(
+                "algorithm.bace.tree_ppo_padding_mode must be "
+                "copy_trainable or zero_loss"
             )
         self.branch_pool_owns_resources = self.branch_pool_mode == "dedicated"
         pairwise_config = bace_config.get("pairwise", {})
@@ -559,6 +567,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             "local_credit_mode": str(self.config.algorithm.bace.local_credit_mode),
             "tree_credit_mode": self.tree_credit_mode,
             "macro_normalization_mode": self.macro_normalization_mode,
+            "tree_ppo_padding_mode": self.tree_ppo_padding_mode,
             "advantage_semantics": "gigpo_macro",
             "gigpo_mode": str(self.config.algorithm.gigpo.mode),
             "gigpo_compute_mean_std_cross_steps": bool(
@@ -852,6 +861,33 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                     self.trace_diagnostics.get("tree_credit_ppo_padding_rows", 0) + 1
                 )
                 continue
+            if bool(metadata_value("bace_ppo_is_padding_copy", index, False)):
+                token_count = int(mask.sum()) if mask is not None else 0
+                masked_advantage_mean = None
+                if advantages is not None and mask is not None and mask.any():
+                    values = advantages[index].detach().cpu().numpy()
+                    masked_advantage_mean = float(values[-len(mask):][mask].mean())
+                self.artifact_store.append("ppo_training_copies", {
+                    "physical_batch_index": index,
+                    "copy_source_row": int(metadata_value(
+                        "bace_ppo_copy_source_row", index, -1
+                    )),
+                    "copy_of_edge_id": metadata_value(
+                        "bace_ppo_copy_of_edge_id", index
+                    ),
+                    "source_type": source_type,
+                    "task_id": metadata_value("uid", index),
+                    "traj_uid": metadata_value("traj_uid", index),
+                    "occurrence_id": metadata_value("occurrence_id", index),
+                    "response_token_count": token_count,
+                    "masked_token_advantage_mean": masked_advantage_mean,
+                })
+                self.trace_diagnostics["tree_credit_ppo_trainable_copy_rows"] = (
+                    self.trace_diagnostics.get(
+                        "tree_credit_ppo_trainable_copy_rows", 0
+                    ) + 1
+                )
+                continue
             source_counts[source_type] = source_counts.get(source_type, 0) + 1
             if diff is not None:
                 stats = source_log_prob_stats.setdefault(
@@ -937,6 +973,8 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             self.artifact_store.append("trainable_occurrences", payload)
         total_tokens = token_counts["root"] + token_counts["branch"]
         self.trace_diagnostics.update({
+            "tree_credit_ppo_physical_rows": int(len(batch)),
+            "tree_credit_unique_trainable_rows": int(sum(source_counts.values())),
             "source_occurrence_counts": source_counts,
             "root_response_tokens": token_counts["root"],
             "branch_response_tokens": token_counts["branch"],
@@ -1809,12 +1847,20 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                     })
                 if not deficient:
                     break
-                pairs = sorted(
-                    (
-                        uid_to_task_index[task_id],
-                        generated_by_task[uid_to_task_index[task_id]],
-                    )
-                    for task_id in deficient
+                # A capacity correction may convert more than one branch slot
+                # into root slots.  Generate every newly required contiguous
+                # slot in this packed wave; emitting only the first missing
+                # slot would leave ``generated_by_task < state.root_count``
+                # before the next assessment.
+                correction_indices = sorted(
+                    uid_to_task_index[task_id] for task_id in deficient
+                )
+                correction_targets = {
+                    index: states[task_uids[index]].root_count
+                    for index in correction_indices
+                }
+                pairs = self._pending_root_slots(
+                    correction_indices, generated_by_task, correction_targets
                 )
                 collect(pairs, "capacity_correction")
             topology_plan = self.topology_planner.finalize(root_logs, states)

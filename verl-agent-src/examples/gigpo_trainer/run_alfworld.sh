@@ -1,6 +1,14 @@
 set -x
-ENGINE=${1:-vllm}
-export VLLM_ATTENTION_BACKEND=XFORMERS
+ENGINE=vllm
+if [[ $# -gt 0 && "$1" != *=* ]]; then
+    ENGINE=$1
+    shift
+fi
+# Do not force xFormers here.  With the project's vLLM 0.11.0 + CUDA 12.8
+# environment, letting vLLM select its CUDA FlashAttention backend avoids the
+# xFormers attention-kernel incompatibility observed on H100.
+unset VLLM_ATTENTION_BACKEND
+export VLLM_USE_FLASHINFER_SAMPLER=${VLLM_USE_FLASHINFER_SAMPLER:-0}
 
 num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
 
