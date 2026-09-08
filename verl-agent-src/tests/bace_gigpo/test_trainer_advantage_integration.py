@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from verl import DataProto
@@ -189,6 +190,34 @@ def test_trainer_tree_credit_filters_copied_origin_before_zero_loss_ppo_padding(
     assert result.meta_info["tree_credit_diagnostics"][
         "tree_credit_copied_origins_removed"
     ] == 1.0
+
+
+@pytest.mark.parametrize(
+    "credit_mode",
+    [
+        "c0_5_origin_family_local_mean",
+        "c4_macro_strict_ancestor",
+        "c8_macro_local_strict_ancestor",
+    ],
+)
+def test_physical_credit_modes_keep_complete_c0_support(credit_mode):
+    result = compute_advantage(
+        _tree_batch(),
+        adv_estimator=AdvantageEstimator.BACE_GiGPO,
+        step_advantage_w=1.0,
+        gamma=0.95,
+        gigpo_mode="mean_norm",
+        bace_credit_mode=credit_mode,
+        bace_tree_credit_mode="current",
+        bace_ppo_world_size=2,
+        bace_ppo_micro_batch_size_per_gpu=32,
+    )
+    assert len(result) == 4
+    assert "branch_origin" in result.non_tensor_batch["source_type"]
+    assert result.non_tensor_batch["bace_credit_mode"].tolist() == [credit_mode] * 4
+    assert result.meta_info["tree_credit_diagnostics"][
+        "tree_credit_copied_origins_removed"
+    ] == 0.0
 
 
 def test_trainer_tree_credit_copy_padding_is_trainable_and_marked():

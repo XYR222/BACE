@@ -2,14 +2,14 @@
 # Full 150-step Exact-Batch-ERV BACE WebShop-1k run on 2 x H100.
 # It is submitted only with an afterok dependency from the smoke gate.
 #SBATCH --job-name=bace_ws_2g_formal
-#SBATCH --partition=c25g
+#SBATCH --partition=c23g
 #SBATCH --account=rwth2089
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=244G
 #SBATCH --gres=gpu:2
-#SBATCH --time=23:30:00
+#SBATCH --time=07:00:00
 #SBATCH --chdir=/hpcwork/xsz96350/fu_project/work-BACE/verl-agent-src
 #SBATCH --output=/hpcwork/xsz96350/fu_project/work-BACE/experiments/webshop1k-qwen2.5-1.5b-exact/slurm/%x-%j.out
 #SBATCH --error=/hpcwork/xsz96350/fu_project/work-BACE/experiments/webshop1k-qwen2.5-1.5b-exact/slurm/%x-%j.err
@@ -38,6 +38,7 @@ TOTAL_STEPS=${BACE_TOTAL_STEPS:-150}
 SAVE_FREQ=${BACE_SAVE_FREQ:-5}
 MAX_CHECKPOINTS=${BACE_MAX_CHECKPOINTS:-2}
 PYTHON_BIN=${WEBSHOP_ENV}/bin/python
+CUMEM_ALLOCATOR_SO=${WEBSHOP_ENV}/lib/python3.10/site-packages/vllm/cumem_allocator.abi3.so
 
 [[ "${TOTAL_STEPS}" =~ ^[1-9][0-9]*$ ]]
 [[ "${SAVE_FREQ}" =~ ^[1-9][0-9]*$ ]]
@@ -70,7 +71,7 @@ export OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 NUMEXPR_MAX_THREADS=1
 export RAYON_NUM_THREADS=1 MALLOC_ARENA_MAX=2
 export TENSORBOARD_DIR
 
-for required in "${REPO_ROOT}" "${WEBSHOP_ENV}" "${MODEL_PATH}" "${TRAIN_FILE}" "${VAL_FILE}" "${JVM_PATH}"; do
+for required in "${REPO_ROOT}" "${WEBSHOP_ENV}" "${MODEL_PATH}" "${TRAIN_FILE}" "${VAL_FILE}" "${JVM_PATH}" "${CUMEM_ALLOCATOR_SO}"; do
     [[ -e "${required}" ]] || { printf 'Missing required asset: %s\n' "${required}" >&2; exit 2; }
 done
 [[ -f ${MODEL_PATH}/model.safetensors.index.json || -f ${MODEL_PATH}/model.safetensors ]] || {
@@ -264,6 +265,15 @@ PY
 nvidia-smi -q > "${METADATA_DIR}/nvidia_smi_q.txt"
 nvidia-smi topo -m > "${METADATA_DIR}/gpu_topology.txt"
 "${PYTHON_BIN}" -m pip freeze > "${METADATA_DIR}/pip_freeze.txt"
+# The WebShop executable-action classifier is part of BACE's strict replay
+# semantics.  Run its focused regression suite in the submitted environment,
+# so this formal run cannot silently fall back to the former full-match rule.
+"${PYTHON_BIN}" -m pytest -q tests/bace_gigpo/test_webshop_replay.py \
+    > "${METADATA_DIR}/webshop_action_classification_test.txt"
+# vLLM 0.8.2's abi3 allocator must use the running CPython's refcount API.
+# Record and enforce the patched artifact used by this run.
+sha256sum "${CUMEM_ALLOCATOR_SO}" > "${METADATA_DIR}/vllm_cumem_allocator.sha256"
+nm -D "${CUMEM_ALLOCATOR_SO}" | grep -q ' U Py_IncRef$'
 
 # Real branch execution is deterministic here, independently of whether a
 # cold Beta(0.2,1.8) PPO step happens to allocate a model-sampled branch.

@@ -175,6 +175,36 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertEqual(metrics["episode/mixed_success_rate"], 0.5)
         self.assertEqual(metrics["episode/success_rate"], 0.5)
 
+    def test_flat_leaf_sources_keep_root_branch_success_scopes(self):
+        batch = DataProto.from_single_dict(
+            data={
+                "token_level_scores": torch.zeros((4, 2)),
+                "token_level_rewards": torch.zeros((4, 2)),
+                "advantages": torch.ones((4, 2)),
+                "returns": torch.ones((4, 2)),
+                "responses": torch.zeros((4, 2), dtype=torch.long),
+                "attention_mask": torch.ones((4, 4), dtype=torch.long),
+            }
+        )
+        batch.non_tensor_batch["traj_uid"] = np.asarray(
+            ["flat-root", "flat-root", "flat-branch", "flat-branch"], dtype=object
+        )
+        batch.non_tensor_batch["source_type"] = np.asarray(
+            ["flat_root", "flat_root", "flat_branch_origin", "flat_branch_suffix"],
+            dtype=object,
+        )
+        batch.non_tensor_batch["episode_rewards"] = np.asarray(
+            [1.0, 1.0, 0.0, 0.0], dtype=np.float32
+        )
+        batch.non_tensor_batch["episode_lengths"] = np.asarray([2.0] * 4)
+        batch.non_tensor_batch["tool_callings"] = np.asarray([0.0] * 4)
+        batch.non_tensor_batch["success_rate"] = np.asarray([1.0, 1.0, 0.0, 0.0])
+
+        metrics = compute_data_metrics(batch, use_critic=False)
+        self.assertEqual(metrics["episode/root_success_rate"], 1.0)
+        self.assertEqual(metrics["episode/branch_success_rate"], 0.0)
+        self.assertEqual(metrics["episode/mixed_success_rate"], 0.5)
+
 
 class TestComputeTimingMetrics(unittest.TestCase):
     """Tests for the compute_timing_metrics function."""

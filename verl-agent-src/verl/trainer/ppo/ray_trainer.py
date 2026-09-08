@@ -541,6 +541,7 @@ def compute_advantage(
     elif adv_estimator == AdvantageEstimator.BACE_GiGPO:
         from recipe.bace_gigpo.advantage import (
             compute_bace_gigpo_advantage,
+            compute_bace_physical_tree_credit_advantage,
             compute_bace_tree_credit_advantage,
             compute_credit_diagnostics,
             resolve_action_ids,
@@ -552,11 +553,21 @@ def compute_advantage(
             len(data),
         )
 
-        tree_credit_mode = kwargs.get("bace_tree_credit_mode", "current")
+        credit_mode = kwargs.get("bace_credit_mode")
+        if credit_mode in (None, "", "null"):
+            credit_mode = kwargs.get("bace_tree_credit_mode", "current")
+        credit_mode = str(credit_mode)
         macro_normalization_mode = kwargs.get(
             "bace_macro_normalization_mode", "stable_occurrence"
         )
-        if tree_credit_mode == "current":
+        c0_like_modes = {"current", "c7_flat_leaf_gigpo"}
+        physical_tree_modes = {
+            "c0_5_origin_family_local_mean",
+            "c4_macro_strict_ancestor",
+            "c8_macro_local_strict_ancestor",
+        }
+        legacy_unique_modes = {"o1_local", "o1_tree_macro", "o1_full_tree"}
+        if credit_mode in c0_like_modes:
             advantages, returns, components = compute_bace_gigpo_advantage(
                 token_level_rewards=data.batch["token_level_rewards"],
                 step_rewards=data.batch["step_rewards"],
@@ -572,7 +583,44 @@ def compute_advantage(
                 compute_mean_std_cross_steps=gigpo_compute_mean_std_cross_steps,
                 local_credit_mode=kwargs.get("bace_local_credit_mode", "occurrence"),
             )
-        else:
+        elif credit_mode in physical_tree_modes:
+            if kwargs.get("bace_local_credit_mode", "occurrence") != "occurrence":
+                raise ValueError(f"{credit_mode} requires local_credit_mode=occurrence")
+            advantages, returns, components = compute_bace_physical_tree_credit_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                step_rewards=data.batch["step_rewards"],
+                response_mask=data.batch["response_mask"],
+                anchor_obs=data.non_tensor_batch["anchor_obs"],
+                task_ids=data.non_tensor_batch["uid"],
+                traj_ids=data.non_tensor_batch["traj_uid"],
+                occurrence_ids=data.non_tensor_batch.get("occurrence_id"),
+                source_types=data.non_tensor_batch.get("source_type"),
+                leaf_ids=data.non_tensor_batch.get("leaf_id"),
+                step_indices=data.non_tensor_batch.get("step_index"),
+                tree_origin_occurrence_ids=data.non_tensor_batch.get(
+                    "tree_origin_occurrence_id"
+                ),
+                tree_parent_root_ids=data.non_tensor_batch.get("tree_parent_root_id"),
+                adjustment_padding_mask=data.non_tensor_batch.get(
+                    "_adjust_batch_padding"
+                ),
+                credit_mode=credit_mode,
+                gamma=gamma,
+                step_advantage_w=step_advantage_w,
+                mode=gigpo_mode,
+                enable_similarity=gigpo_enable_similarity,
+                similarity_thresh=gigpo_similarity_thresh,
+                compute_mean_std_cross_steps=gigpo_compute_mean_std_cross_steps,
+            )
+            tree_metadata = components.pop("metadata")
+            data.non_tensor_batch.update(tree_metadata)
+            data.meta_info["tree_credit_diagnostics"] = components.pop(
+                "tree_diagnostics"
+            )
+            data.meta_info["tree_credit_branch_evidence"] = components.pop(
+                "branch_evidence"
+            )
+        elif credit_mode in legacy_unique_modes:
             if kwargs.get("bace_local_credit_mode", "occurrence") != "occurrence":
                 raise ValueError("C1/C2/C3 require local_credit_mode=occurrence")
             advantages, returns, components = compute_bace_tree_credit_advantage(
@@ -595,7 +643,7 @@ def compute_advantage(
                 adjustment_padding_mask=data.non_tensor_batch.get(
                     "_adjust_batch_padding"
                 ),
-                tree_credit_mode=tree_credit_mode,
+                tree_credit_mode=credit_mode,
                 macro_normalization_mode=macro_normalization_mode,
                 gamma=gamma,
                 step_advantage_w=step_advantage_w,
@@ -616,6 +664,8 @@ def compute_advantage(
                 data.batch["attention_mask"], dim=-1
             ).tolist()
             action_ids = action_ids[keep_indices]
+        else:
+            raise ValueError(f"Unknown algorithm.bace.credit_mode: {credit_mode}")
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
         data.non_tensor_batch["bace_macro_advantage"] = components["macro"].detach().cpu().numpy()
@@ -635,7 +685,7 @@ def compute_advantage(
             similarity_thresh=gigpo_similarity_thresh,
             source_types=data.non_tensor_batch.get("source_type"),
         )
-        if tree_credit_mode != "current":
+        if credit_mode in legacy_unique_modes:
             data, ppo_padding_diagnostics = _pad_tree_credit_ppo_batch(
                 data,
                 world_size=kwargs.get("bace_ppo_world_size", 1),
@@ -1541,11 +1591,28 @@ class RayPPOTrainer:
                         AdvantageEstimator.GiGPO,
                         AdvantageEstimator.BACE_GiGPO,
                     ):
+                        bace_credit_mode = self.config.algorithm.bace.get(
+                            "credit_mode", None
+                        ) if self.config.algorithm.adv_estimator == AdvantageEstimator.BACE_GiGPO else None
+                        if bace_credit_mode in (None, "", "null"):
+                            bace_credit_mode = self.config.algorithm.bace.get(
+                                "tree_credit_mode", "current"
+                            ) if self.config.algorithm.adv_estimator == AdvantageEstimator.BACE_GiGPO else None
+                        if bace_credit_mode == "c7_flat_leaf_gigpo":
+                            from recipe.bace_gigpo.flat_leaf import (
+                                expand_tree_to_full_leaf_trajectories,
+                            )
+
+                            batch = expand_tree_to_full_leaf_trajectories(batch)
                         step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
                             batch=batch,
                             gamma=self.config.algorithm.gamma
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
+                        if bace_credit_mode == "c7_flat_leaf_gigpo":
+                            batch.non_tensor_batch[
+                                "bace_flat_full_leaf_step_return"
+                            ] = step_rewards_tensor.detach().cpu().numpy()
                     
                     batch = adjust_batch(self.config, batch)
 
@@ -1638,6 +1705,13 @@ class RayPPOTrainer:
                                                                                   invalid_action_penalty_coef=self.config.actor_rollout_ref.actor.invalid_action_penalty_coef,
                                                                                   )
                             metrics.update(invalid_metrics)
+                        if bace_credit_mode == "c7_flat_leaf_gigpo":
+                            # Keep the C7 trace field aligned with the actual G
+                            # consumed by GiGPO, including production's
+                            # occurrence-local invalid-action correction.
+                            batch.non_tensor_batch[
+                                "bace_flat_full_leaf_step_return"
+                            ] = batch.batch["step_rewards"].detach().cpu().numpy().copy()
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -1674,6 +1748,9 @@ class RayPPOTrainer:
                             bace_local_credit_mode=self.config.algorithm.bace.local_credit_mode,
                             bace_tree_credit_mode=self.config.algorithm.bace.get(
                                 "tree_credit_mode", "current"
+                            ),
+                            bace_credit_mode=self.config.algorithm.bace.get(
+                                "credit_mode", None
                             ),
                             bace_macro_normalization_mode=self.config.algorithm.bace.get(
                                 "macro_normalization_mode", "stable_occurrence"

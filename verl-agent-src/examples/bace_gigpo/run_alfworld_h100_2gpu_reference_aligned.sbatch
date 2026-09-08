@@ -55,6 +55,7 @@ RUN_NAME=${BACE_RUN_NAME:-bace_alfworld_qwen2_5_1_5b_exact_2gpu_reference_seed0}
 INVOCATION_ID=${BACE_INVOCATION_ID:-${SLURM_JOB_ID:-local}_2gpu_${SCHEDULING_PROFILE}_to_step_${TARGET_STEP}}
 SEED=${BACE_SEED:-0}
 TREE_CREDIT_MODE=${TREE_CREDIT_MODE:-current}
+BACE_CREDIT_MODE=${BACE_CREDIT_MODE:-null}
 MACRO_NORMALIZATION_MODE=${MACRO_NORMALIZATION_MODE:-stable_occurrence}
 SAVE_FREQ=${SAVE_FREQ:-5}
 MAX_CHECKPOINTS=${MAX_CHECKPOINTS:-2}
@@ -65,6 +66,7 @@ MILESTONE_CHECKPOINT_STEPS=${MILESTONE_CHECKPOINT_STEPS:-10,75,100,140}
 [[ "${CAPACITY_CORRECTION_BATCH_SIZE}" =~ ^[0-9]+$ ]] && (( CAPACITY_CORRECTION_BATCH_SIZE >= 1 ))
 [[ "${SEED}" =~ ^[0-9]+$ ]]
 [[ "${TREE_CREDIT_MODE}" =~ ^(current|o1_local|o1_tree_macro|o1_full_tree)$ ]]
+[[ "${BACE_CREDIT_MODE}" =~ ^(null|current|c0_5_origin_family_local_mean|c4_macro_strict_ancestor|c7_flat_leaf_gigpo|c8_macro_local_strict_ancestor)$ ]]
 [[ "${MACRO_NORMALIZATION_MODE}" == stable_occurrence ]]
 [[ "${SAVE_FREQ}" =~ ^[0-9]+$ ]] && (( SAVE_FREQ >= 1 ))
 [[ "${MAX_CHECKPOINTS}" =~ ^(1|2)$ ]]
@@ -117,6 +119,18 @@ export MALLOC_ARENA_MAX=2
 export TENSORBOARD_DIR
 unset PYTORCH_CUDA_ALLOC_CONF
 
+# A c23g node can host two independent 2-GPU jobs.  Ray otherwise places its
+# session symlink, sockets and dashboard state under the same /tmp/ray root.
+# Give every Slurm job a private node-local runtime tree so simultaneous Ray +
+# ALFWorld actor pools cannot corrupt or discover one another's session state.
+RAY_JOB_TOKEN=${SLURM_JOB_ID:-${INVOCATION_ID}}
+[[ "${RAY_JOB_TOKEN}" =~ ^[A-Za-z0-9_.-]+$ ]]
+RAY_JOB_TMP=/tmp/bace_ray_${USER}_${RAY_JOB_TOKEN}
+mkdir -p "${RAY_JOB_TMP}/ray" "${RAY_JOB_TMP}/hf_datasets"
+export TMPDIR=${RAY_JOB_TMP}
+export RAY_TMPDIR=${RAY_JOB_TMP}
+export HF_DATASETS_CACHE=${RAY_JOB_TMP}/hf_datasets
+
 for required_path in \
     "${MODEL_PATH}" "${ALFWORLD_DATA}" "${TRAIN_FILE}" "${VAL_FILE}"; do
     [[ -e "${required_path}" ]] || {
@@ -141,6 +155,22 @@ if [[ "${DRY_RUN:-0}" != 1 && -f "${tracker}" ]]; then
         --keep "${MAX_CHECKPOINTS}" \
         --output "${METADATA_DIR}/checkpoint_prune_before.json"
     latest_step=$(<"${tracker}")
+    # A wall-time kill can happen after a step artifact is finalized but
+    # before the next checkpoint.  Those steps will be recomputed after
+    # resume; archive their old traces so the final validator sees exactly one
+    # authoritative attempt per logical step.  The move is recoverable.
+    ORPHAN_ARTIFACT_DIR=${ARTIFACT_DIR}/_orphaned_pre_resume/${INVOCATION_ID}
+    for step_dir in "${ARTIFACT_DIR}"/step_*; do
+        [[ -d "${step_dir}" ]] || continue
+        step_name=${step_dir##*/}
+        if [[ "${step_name}" =~ ^step_([0-9]{8})(_attempt_[0-9]{2})?$ ]]; then
+            artifact_step=$((10#${BASH_REMATCH[1]}))
+            if (( artifact_step > latest_step )); then
+                mkdir -p "${ORPHAN_ARTIFACT_DIR}"
+                mv -- "${step_dir}" "${ORPHAN_ARTIFACT_DIR}/"
+            fi
+        fi
+    done
     if (( latest_step >= TARGET_STEP )); then
         python3 -m recipe.bace_gigpo.validate_trace "${ARTIFACT_DIR}" \
             --output "${REPORT_DIR}/${INVOCATION_ID}_already_complete.json"
@@ -181,6 +211,7 @@ ppo_command=(
     algorithm.bace.invalid_action_mode=strict_identity
     algorithm.bace.tie_break_identity_mode=stable_v1
     algorithm.bace.local_credit_mode=occurrence
+    algorithm.bace.credit_mode="${BACE_CREDIT_MODE}"
     algorithm.bace.tree_credit_mode="${TREE_CREDIT_MODE}"
     algorithm.bace.macro_normalization_mode="${MACRO_NORMALIZATION_MODE}"
     algorithm.bace.tree_ppo_padding_mode=copy_trainable
@@ -257,6 +288,8 @@ ppo_command=(
     trainer.resume_mode=auto
     trainer.max_actor_ckpt_to_keep="${MAX_CHECKPOINTS}"
     ray_init.num_cpus=32
+    +ray_init._temp_dir="${RAY_JOB_TMP}/ray"
+    +ray_init.include_dashboard=False
 )
 
 if [[ "${MILESTONE_CHECKPOINT_ENABLED}" == true ]]; then
@@ -278,8 +311,8 @@ printf '\n' >> "${METADATA_DIR}/resolved_command.sh"
         "${SCHEDULING_PROFILE}" "${BRANCH_POOL_MODE}" "${ROOT_ACTIVE_EXECUTOR}"
     printf 'min_natural_roots=%q\ncapacity_correction_batch_size=%q\n' \
         "${MIN_NATURAL_ROOTS}" "${CAPACITY_CORRECTION_BATCH_SIZE}"
-    printf 'tree_credit_mode=%q\nmacro_normalization_mode=%q\n' \
-        "${TREE_CREDIT_MODE}" "${MACRO_NORMALIZATION_MODE}"
+    printf 'credit_mode=%q\ntree_credit_mode=%q\nmacro_normalization_mode=%q\n' \
+        "${BACE_CREDIT_MODE}" "${TREE_CREDIT_MODE}" "${MACRO_NORMALIZATION_MODE}"
     printf 'tensorboard_dir=%q\n' "${TENSORBOARD_DIR}"
     printf 'milestone_checkpoint_steps=%q\nmilestone_checkpoint_dir=%q\n' \
         "${MILESTONE_CHECKPOINT_STEPS}" "${MILESTONE_CHECKPOINT_DIR}"

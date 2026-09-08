@@ -7,6 +7,7 @@ import torch
 from recipe.bace_gigpo.advantage import (
     build_tree_credit_index,
     compute_bace_gigpo_advantage,
+    compute_bace_physical_tree_credit_advantage,
     compute_bace_tree_credit_advantage,
 )
 
@@ -60,6 +61,15 @@ def _compute(mode: str, gamma: float = 1.0):
     )
 
 
+def _compute_physical(mode: str, gamma: float = 1.0):
+    values = _tree_batch()
+    values.pop("raw_rewards")
+    values.pop("episode_rewards")
+    return compute_bace_physical_tree_credit_advantage(
+        **values, credit_mode=mode, gamma=gamma, mode="mean_norm"
+    )
+
+
 def test_direct_and_descendant_sets_preserve_concrete_occurrences():
     values = _tree_batch()
     tree = build_tree_credit_index(
@@ -75,6 +85,8 @@ def test_direct_and_descendant_sets_preserve_concrete_occurrences():
     assert tree.descendant_branch_ids_by_edge["e2"] == ("b1", "b2")
     assert tree.direct_branch_ids_by_edge["e3"] == ("b2",)
     assert tree.descendant_branch_ids_by_edge["e3"] == ("b2",)
+    assert tree.strict_descendant_branch_ids_by_edge["e2"] == ("b2",)
+    assert "e3" not in tree.strict_descendant_branch_ids_by_edge
     # e2/e3 deliberately share the same anchor/action-style identity but stay distinct.
     assert "e2" in tree.root_row_by_occurrence and "e3" in tree.root_row_by_occurrence
 
@@ -286,3 +298,90 @@ def test_adjust_batch_copy_is_macro_evidence_but_not_a_duplicate_edge():
     assert components["keep_indices"].tolist() == [0, 1, 2, 3, 5]
     assert components["tree_diagnostics"]["tree_credit_copied_origins_removed"] == 2.0
     assert components["tree_diagnostics"]["tree_credit_adjustment_padding_removed"] == 1.0
+
+
+def test_c05_smooths_only_concrete_origin_family_and_conserves_local_mass():
+    _, _, components = _compute_physical("c0_5_origin_family_local_mean")
+    meta = components["metadata"]
+    # Natural e2 and its concrete copied origin b1:o form a replay family.
+    family_rows = [2, 4]
+    expected = float(np.mean(meta["bace_local_c0"][family_rows]))
+    np.testing.assert_allclose(meta["bace_local_c0_5"][family_rows], expected)
+    assert np.sum(meta["bace_local_c0_5"][family_rows]) == pytest.approx(
+        np.sum(meta["bace_local_c0"][family_rows])
+    )
+    # A same-anchor natural occurrence and branch suffix are not family members.
+    assert meta["bace_origin_family_id"][3] == "e3"
+    assert meta["bace_origin_family_id"][5] == ""
+    np.testing.assert_array_equal(components["macro"], meta["bace_macro_c0"])
+    assert len(components["occurrence"]) == len(_tree_batch()["source_types"])
+
+
+def test_c05_includes_trainable_adjustment_copies_in_physical_family_mass():
+    values = _tree_batch()
+    values.pop("raw_rewards")
+    values.pop("episode_rewards")
+    duplicate = 4  # a trainable adjust_batch copy of branch-origin b1:o
+    original_size = len(values["source_types"])
+    for key, value in list(values.items()):
+        if isinstance(value, torch.Tensor):
+            values[key] = torch.cat([value, value[duplicate : duplicate + 1]], dim=0)
+        elif isinstance(value, np.ndarray):
+            values[key] = np.concatenate([value, value[duplicate : duplicate + 1]])
+    values["adjustment_padding_mask"] = np.asarray(
+        [False] * original_size + [True], dtype=bool
+    )
+    _, _, components = compute_bace_physical_tree_credit_advantage(
+        **values,
+        credit_mode="c0_5_origin_family_local_mean",
+        mode="mean_norm",
+    )
+    meta = components["metadata"]
+    family_rows = [2, 4, original_size]
+    assert meta["bace_origin_family_size"][family_rows].tolist() == [3, 3, 3]
+    np.testing.assert_allclose(
+        meta["bace_local_c0_5"][family_rows],
+        np.mean(meta["bace_local_c0"][family_rows]),
+    )
+    assert np.sum(meta["bace_local_c0_5"][family_rows]) == pytest.approx(
+        np.sum(meta["bace_local_c0"][family_rows])
+    )
+    diagnostics = components["tree_diagnostics"]
+    assert diagnostics["tree_credit_physical_occurrences"] == 8.0
+    assert diagnostics["tree_credit_unique_occurrences"] == 7.0
+    assert diagnostics["tree_credit_adjustment_padding_rows"] == 1.0
+
+
+def test_c4_changes_only_unselected_strict_ancestor_and_keeps_local_c0():
+    _, _, c4 = _compute_physical("c4_macro_strict_ancestor", gamma=0.1)
+    meta = c4["metadata"]
+    # e0/e1 are strict ancestors. e2/e3 are selected origins and remain C0.
+    for row in (2, 3, 4, 5, 6):
+        assert meta["bace_macro_c4"][row] == pytest.approx(meta["bace_macro_c0"][row])
+    assert meta["bace_strict_descendant_branch_ids"][0] == ("b1", "b2")
+    assert meta["bace_strict_descendant_branch_ids"][1] == ("b1", "b2")
+    assert meta["bace_macro_candidates"][0][0] == pytest.approx(
+        meta["bace_macro_c0"][0]
+    )
+    np.testing.assert_array_equal(c4["local"], meta["bace_local_c0"])
+    # Macro is independent of gamma.
+    _, _, other_gamma = _compute_physical("c4_macro_strict_ancestor", gamma=0.9)
+    torch.testing.assert_close(c4["macro"], other_gamma["macro"], rtol=0, atol=0)
+
+
+def test_c8_recomputes_local_on_full_physical_support_and_shares_c4_macro():
+    _, _, c4 = _compute_physical("c4_macro_strict_ancestor", gamma=0.5)
+    _, _, c8 = _compute_physical("c8_macro_local_strict_ancestor", gamma=0.5)
+    torch.testing.assert_close(c8["macro"], c4["macro"], rtol=0, atol=0)
+    meta = c8["metadata"]
+    # Explicit G override only targets unselected strict ancestors.
+    np.testing.assert_array_equal(meta["bace_g_c8_override"][2:], meta["bace_g_c0"][2:])
+    expected_e0 = np.mean([
+        3.25,
+        3.25 + 0.5 ** 2 * (100 - 5),
+        3.25 + 0.5 ** 3 * (200 - 4),
+    ])
+    assert meta["bace_g_c8_override"][0] == pytest.approx(expected_e0)
+    # All seven physical occurrences, including copied origins, remain PPO rows.
+    assert len(c8["occurrence"]) == 7
+    assert not torch.equal(c8["local"], c4["local"])

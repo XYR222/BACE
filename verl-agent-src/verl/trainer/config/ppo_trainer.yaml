@@ -303,7 +303,10 @@ algorithm:
       batch_size: 2  # fixed at K=2 in the first Pairwise implementation
     local_prior_strength: 2.0
     local_credit_mode: occurrence  # occurrence | action_mean
-    tree_credit_mode: current  # current | o1_local | o1_tree_macro | o1_full_tree
+    # Canonical interface.  null preserves backward compatibility by falling
+    # back to tree_credit_mode below.
+    credit_mode: null  # current | c0_5_origin_family_local_mean | c4_macro_strict_ancestor | c7_flat_leaf_gigpo | c8_macro_local_strict_ancestor | legacy C1/C2/C3 values
+    tree_credit_mode: current  # deprecated compatibility alias: current | o1_local | o1_tree_macro | o1_full_tree
     macro_normalization_mode: stable_occurrence  # strict_leaf_uniform is reserved for a separate ablation
     tree_ppo_padding_mode: copy_trainable  # copy_trainable aligns C1/C2/C3 batching with upstream GiGPO/C0; zero_loss is retained as an ablation
     invalid_action_mode: strict_identity  # strict_identity | valid_only_branch | single_invalid_bucket

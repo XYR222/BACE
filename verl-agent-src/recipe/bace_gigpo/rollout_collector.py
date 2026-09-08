@@ -59,21 +59,25 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         self.branch_pool_mode = str(
             bace_config.get("branch_pool_mode", "dedicated")
         )
-        self.tree_credit_mode = str(
-            bace_config.get("tree_credit_mode", "current")
-        )
+        configured_credit_mode = bace_config.get("credit_mode", None)
+        if configured_credit_mode in (None, "", "null"):
+            configured_credit_mode = bace_config.get("tree_credit_mode", "current")
+        self.credit_mode = str(configured_credit_mode)
+        # Retained for old checkpoint/manifests and C1/C2/C3 callers.
+        self.tree_credit_mode = self.credit_mode
         self.macro_normalization_mode = str(
             bace_config.get("macro_normalization_mode", "stable_occurrence")
         )
         self.tree_ppo_padding_mode = str(
             bace_config.get("tree_ppo_padding_mode", "copy_trainable")
         )
-        if self.tree_credit_mode not in {
-            "current", "o1_local", "o1_tree_macro", "o1_full_tree"
+        if self.credit_mode not in {
+            "current", "o1_local", "o1_tree_macro", "o1_full_tree",
+            "c0_5_origin_family_local_mean", "c4_macro_strict_ancestor",
+            "c7_flat_leaf_gigpo", "c8_macro_local_strict_ancestor",
         }:
             raise ValueError(
-                "algorithm.bace.tree_credit_mode must be current, o1_local, "
-                "o1_tree_macro, or o1_full_tree"
+                "algorithm.bace.credit_mode is not a supported BACE credit mode"
             )
         if self.macro_normalization_mode != "stable_occurrence":
             raise ValueError(
@@ -192,7 +196,9 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 "staged_root_batching=frontier requires topology=dynamic and "
                 "dynamic_root_generation=staged"
             )
-        if self.tree_credit_mode != "current" and self.staged_root_batching == "frontier":
+        if self.credit_mode in {
+            "o1_local", "o1_tree_macro", "o1_full_tree"
+        } and self.staged_root_batching == "frontier":
             raise ValueError("C1/C2/C3 tree credit currently require packed rollout batching")
         if self.variant == "batch_erv_exact" and (
             self.topology != "dynamic"
@@ -565,6 +571,7 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             "invalid_action_mode": self.invalid_action_mode,
             "tie_break_identity_mode": self.tie_break_identity_mode,
             "local_credit_mode": str(self.config.algorithm.bace.local_credit_mode),
+            "credit_mode": self.credit_mode,
             "tree_credit_mode": self.tree_credit_mode,
             "macro_normalization_mode": self.macro_normalization_mode,
             "tree_ppo_padding_mode": self.tree_ppo_padding_mode,
@@ -898,7 +905,8 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 stats["count"] += int(len(active_rollout))
                 stats["probability_max"] = max(stats["probability_max"], probability_max_diff)
             token_count = int(mask.sum()) if mask is not None else 0
-            token_counts["root" if source_type == "root" else "branch"] += token_count
+            is_root_source = source_type in {"root", "flat_root"}
+            token_counts["root" if is_root_source else "branch"] += token_count
             masked_advantage_mean = None
             if advantages is not None and mask is not None and mask.any():
                 values = advantages[index].detach().cpu().numpy()
@@ -915,8 +923,11 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                        "terminal_reward": metadata_value("episode_rewards", index),
                        "episode_success": bool(float(metadata_value("episode_rewards", index, 0.0)) > 0),
                        "success_scope": (
-                           "root" if source_type == "root"
-                           else "branch" if source_type.startswith("branch_")
+                           "root" if source_type in {"root", "flat_root"}
+                           else "branch" if (
+                               source_type.startswith("branch_")
+                               or source_type.startswith("flat_branch_")
+                           )
                            else "unknown"
                        ),
                        "macro_advantage": metadata_value("bace_macro_advantage", index),
@@ -949,6 +960,36 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 "final_c3": "bace_final_c3",
                 "tree_credit_mode": "bace_tree_credit_mode",
                 "macro_normalization_mode": "bace_macro_normalization_mode",
+                "credit_mode": "bace_credit_mode",
+                "branch_id": "bace_branch_id",
+                "natural_origin_occurrence_id": "bace_natural_origin_occurrence_id",
+                "macro_c0": "bace_macro_c0",
+                "local_c0": "bace_local_c0",
+                "origin_family_id": "bace_origin_family_id",
+                "family_size": "bace_origin_family_size",
+                "local_family_mean": "bace_local_family_mean",
+                "local_c0_5": "bace_local_c0_5",
+                "strict_descendant_branch_ids": "bace_strict_descendant_branch_ids",
+                "macro_branch_delta": "bace_macro_branch_delta",
+                "macro_candidates": "bace_macro_candidates",
+                "macro_c4": "bace_macro_c4",
+                "g_c0": "bace_g_c0",
+                "g_candidates": "bace_g_candidates",
+                "delta_g": "bace_g_branch_delta",
+                "branch_origin_g": "bace_branch_origin_g",
+                "natural_origin_g": "bace_natural_origin_g",
+                "distance": "bace_g_distance",
+                "gamma_discount": "bace_g_gamma_discount",
+                "g_c8_override": "bace_g_c8_override",
+                "local_c8": "bace_local_c8",
+                "flat_traj_uid": "bace_flat_traj_uid",
+                "source_root_id": "bace_flat_source_root_id",
+                "source_branch_id": "bace_flat_source_branch_id",
+                "copied_prefix_length": "bace_flat_copied_prefix_length",
+                "is_flattened_prefix_copy": "bace_flat_is_prefix_copy",
+                "flat_source_occurrence_id": "bace_flat_source_occurrence_id",
+                "full_leaf_terminal_reward": "bace_flat_full_leaf_terminal_reward",
+                "full_leaf_step_return": "bace_flat_full_leaf_step_return",
             }
             for trace_name, metadata_name in tree_trace_fields.items():
                 value = metadata_value(metadata_name, index)
@@ -995,9 +1036,12 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             count
             for source, count in source_counts.items()
             if str(source).startswith("branch_")
+            or str(source).startswith("flat_branch_")
         )
         self.last_bace_metrics.update({
-            "root_trainable_occurrences": int(source_counts.get("root", 0)),
+            "root_trainable_occurrences": int(
+                source_counts.get("root", 0) + source_counts.get("flat_root", 0)
+            ),
             "branch_trainable_occurrences": int(branch_occurrences),
             "root_trainable_tokens": int(token_counts["root"]),
             "branch_trainable_tokens": int(token_counts["branch"]),

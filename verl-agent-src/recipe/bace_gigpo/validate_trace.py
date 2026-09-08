@@ -18,7 +18,11 @@ def _json(path: Path):
 def _jsonl(path: Path):
     if not path.exists():
         return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    # Iterate by physical newline.  str.splitlines() also splits the valid JSON
+    # string characters U+2028/U+2029 and previously made successful ALFWorld
+    # traces fail validation when an observation contained either separator.
+    with path.open("r", encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
 
 
 def _close_sequence(left, right, tolerance=1e-7):
@@ -209,17 +213,32 @@ def validate_step(step_dir: Path, max_recomputed_logprob_diff=None,
         str(record.get("traj_uid")) for record in occurrences
         if record.get("source_type") in {"branch_origin", "branch_suffix"}
     }
+    trained_branch_ids.update(
+        str(record.get("source_branch_id")) for record in occurrences
+        if str(record.get("source_type", "")).startswith("flat_branch_")
+        and record.get("source_branch_id")
+    )
     unknown_trained = trained_branch_ids.difference(successful_branches)
     if unknown_trained:
         errors.append(f"training batch contains failed/unknown branches: {sorted(unknown_trained)}")
 
-    tree_credit_mode = str(manifest.get("tree_credit_mode", "current"))
+    credit_mode = manifest.get("credit_mode")
+    if credit_mode in (None, "", "null"):
+        credit_mode = manifest.get("tree_credit_mode", "current")
+    tree_credit_mode = str(credit_mode)
     macro_normalization_mode = str(
         manifest.get("macro_normalization_mode", "stable_occurrence")
     )
-    if tree_credit_mode != "current":
-        if tree_credit_mode not in {"o1_local", "o1_tree_macro", "o1_full_tree"}:
-            errors.append(f"unknown tree credit mode: {tree_credit_mode}")
+    legacy_unique_modes = {"o1_local", "o1_tree_macro", "o1_full_tree"}
+    physical_tree_modes = {
+        "c0_5_origin_family_local_mean",
+        "c4_macro_strict_ancestor",
+        "c8_macro_local_strict_ancestor",
+    }
+    known_modes = {"current", "c7_flat_leaf_gigpo"} | legacy_unique_modes | physical_tree_modes
+    if tree_credit_mode not in known_modes:
+        errors.append(f"unknown BACE credit mode: {tree_credit_mode}")
+    if tree_credit_mode in legacy_unique_modes:
         if macro_normalization_mode != "stable_occurrence":
             errors.append(
                 "tree credit unexpectedly changed macro normalization away from stable_occurrence"
@@ -344,6 +363,59 @@ def validate_step(step_dir: Path, max_recomputed_logprob_diff=None,
                 "origin_occurrence_id"
             ):
                 errors.append(f"branch {branch_id}: tree-credit origin mismatch")
+    elif tree_credit_mode in physical_tree_modes:
+        required = {"credit_mode", "macro_c0", "local_c0"}
+        for occurrence in occurrences:
+            missing_fields = sorted(required.difference(occurrence))
+            if missing_fields:
+                errors.append(
+                    f"occurrence {occurrence.get('occurrence_id')}: missing physical-credit fields {missing_fields}"
+                )
+                continue
+            if occurrence["credit_mode"] != tree_credit_mode:
+                errors.append(
+                    f"occurrence {occurrence.get('occurrence_id')}: credit-mode mismatch"
+                )
+            if tree_credit_mode == "c0_5_origin_family_local_mean" and not math.isclose(
+                float(occurrence["macro_advantage"]),
+                float(occurrence["macro_c0"]), rel_tol=0.0, abs_tol=1e-6,
+            ):
+                errors.append(
+                    f"occurrence {occurrence.get('occurrence_id')}: C0.5 changed macro"
+                )
+            if tree_credit_mode in {
+                "c4_macro_strict_ancestor", "c8_macro_local_strict_ancestor"
+            } and "macro_c4" not in occurrence:
+                errors.append(
+                    f"occurrence {occurrence.get('occurrence_id')}: missing C4 macro"
+                )
+        checks["physical_tree_credit"] = {
+            "mode": tree_credit_mode,
+            "physical_ppo_rows": len(occurrences),
+            "copied_origins_trainable": len(by_source.get("branch_origin", [])),
+        }
+    elif tree_credit_mode == "c7_flat_leaf_gigpo":
+        required = {
+            "flat_traj_uid", "source_root_id", "copied_prefix_length",
+            "is_flattened_prefix_copy", "full_leaf_terminal_reward",
+            "full_leaf_step_return",
+        }
+        for occurrence in occurrences:
+            missing_fields = sorted(required.difference(occurrence))
+            if missing_fields:
+                errors.append(
+                    f"occurrence {occurrence.get('occurrence_id')}: missing C7 fields {missing_fields}"
+                )
+        flat_trajectories = {str(row.get("flat_traj_uid")) for row in occurrences}
+        expected_flat = len(root_ids) + len(successful_branches)
+        if len(flat_trajectories) != expected_flat:
+            errors.append(
+                f"C7 flat trajectory count {len(flat_trajectories)} != terminal leaf count {expected_flat}"
+            )
+        checks["flat_leaf_credit"] = {
+            "flat_trajectories": len(flat_trajectories),
+            "expected_terminal_leaves": expected_flat,
+        }
 
     advantage_semantics = manifest.get("advantage_semantics", "leaf_uniform")
     if advantage_semantics == "leaf_uniform":

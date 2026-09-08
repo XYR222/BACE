@@ -96,7 +96,13 @@ def _episode_success_groups(batch: DataProto) -> Dict[str, np.ndarray]:
         key = str(traj_uid)
         success = bool(float(reward) > 0)
         source = str(source_type)
-        scope = "root" if source == "root" else "branch" if source.startswith("branch_") else "mixed"
+        scope = (
+            "root"
+            if source in {"root", "flat_root"}
+            else "branch"
+            if source.startswith("branch_") or source.startswith("flat_branch_")
+            else "mixed"
+        )
         record = episodes.setdefault(key, {"success": success, "scopes": set()})
         if record["success"] != success:
             raise ValueError(f"Trajectory {key} has inconsistent episode_rewards")

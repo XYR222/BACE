@@ -14,6 +14,9 @@ from agent_system.environments.env_package.webshop.projection import (
     webshop_action_is_executable,
     webshop_projection,
 )
+from agent_system.environments.strict_actions import (
+    parse_webshop_environment_action,
+)
 from recipe.bace_gigpo.replay.validator import ReplayCategory, ReplayValidator
 
 
@@ -232,6 +235,43 @@ def test_webshop_search_template_is_executable_but_clicks_are_exact():
     assert webshop_action_is_executable("click[red shoe]", action_set)
     assert not webshop_action_is_executable("search[]", action_set)
     assert not webshop_action_is_executable("click[blue shoe]", action_set)
+
+
+def test_webshop_dependency_light_parser_preserves_upstream_match_semantics():
+    assert parse_webshop_environment_action("click[item]") == ("click", "item")
+    assert parse_webshop_environment_action("click[item]trailing text") == (
+        "click", "item"
+    )
+    assert parse_webshop_environment_action("search[red shoes]trailing text") == (
+        "search", "red shoes"
+    )
+    assert parse_webshop_environment_action("search[]") == ("search[]", None)
+    assert parse_webshop_environment_action("not-an-action") == (
+        "not-an-action", None
+    )
+
+
+def test_webshop_executability_matches_real_dispatch_corner_cases():
+    action_set = ["search[<your query>]", "click[search]", "click[item]"]
+
+    # The upstream parser ignores text after the matched closing bracket.
+    assert webshop_action_is_executable("click[item]trailing text", action_set)
+    assert webshop_action_is_executable("search[query]trailing text", ())
+
+    # WebShop can dispatch search even if the rendered page has no search-bar
+    # template, while click[search] is explicitly rejected by env.step().
+    assert webshop_action_is_executable("search[query]", ())
+    assert not webshop_action_is_executable("click[search]", action_set)
+
+
+def test_webshop_valid_identity_uses_the_environment_parsed_action():
+    raw = (
+        "<think>Open the item.</think>"
+        "<action>click[item]trailing text</action>"
+    )
+    assert webshop_action_identity(
+        raw, "click[item]trailing text", True, True
+    ) == "valid::click[item]"
 
 
 def test_selected_manager_rejects_ambiguous_slots_and_unreset_steps():

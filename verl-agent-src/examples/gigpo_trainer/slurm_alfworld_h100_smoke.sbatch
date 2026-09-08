@@ -18,10 +18,17 @@
 set -euo pipefail
 
 module purge
+# ALFWorld/TextWorld's Fast Downward extension requires GLIBCXX_3.4.32.
+# Keep this aligned with the previously successful AFH GiGPO jobs.
+module load GCCcore/13.3.0
 module load CUDA/12.8.0
 source /home/xsz96350/miniforge3/etc/profile.d/conda.sh
 conda activate /hpcwork/xsz96350/fu_project/verl-agent
 
+# These ROCm variables are inherited on some cluster shells.  veRL rejects
+# them when Slurm has correctly set CUDA_VISIBLE_DEVICES for an H100 job.
+unset ROCR_VISIBLE_DEVICES
+unset HIP_VISIBLE_DEVICES
 export ALFWORLD_DATA=/home/xsz96350/.cache/alfworld
 export TENSORBOARD_DIR=/hpcwork/xsz96350/fu_project/work-BACE/experiments/gigpo-alfworld-upstream-smoke/tensorboard/${SLURM_JOB_ID}
 mkdir -p "${TENSORBOARD_DIR}" /hpcwork/xsz96350/fu_project/work-BACE/experiments/gigpo-alfworld-upstream-smoke/slurm
@@ -53,5 +60,6 @@ bash examples/gigpo_trainer/run_alfworld.sh vllm \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
     trainer.total_epochs=1 \
+    trainer.total_training_steps=1 \
     trainer.val_before_train=false \
     trainer.validate_on_last_step=false

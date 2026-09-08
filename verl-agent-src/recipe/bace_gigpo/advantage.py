@@ -17,6 +17,19 @@ class TreeCreditMode(str, Enum):
     O1_FULL_TREE = "o1_full_tree"
 
 
+class BaceCreditMode(str, Enum):
+    """Canonical optimizer/credit modes supported by the BACE collector."""
+
+    CURRENT = "current"
+    O1_LOCAL = "o1_local"
+    O1_TREE_MACRO = "o1_tree_macro"
+    O1_FULL_TREE = "o1_full_tree"
+    C0_5_ORIGIN_FAMILY_LOCAL_MEAN = "c0_5_origin_family_local_mean"
+    C4_MACRO_STRICT_ANCESTOR = "c4_macro_strict_ancestor"
+    C7_FLAT_LEAF_GIGPO = "c7_flat_leaf_gigpo"
+    C8_MACRO_LOCAL_STRICT_ANCESTOR = "c8_macro_local_strict_ancestor"
+
+
 class MacroNormalizationMode(str, Enum):
     STABLE_OCCURRENCE = "stable_occurrence"
     STRICT_LEAF_UNIFORM = "strict_leaf_uniform"
@@ -35,6 +48,7 @@ class TreeCreditIndex:
     branch_leaf_by_id: dict[str, str]
     direct_branch_ids_by_edge: dict[str, tuple[str, ...]]
     descendant_branch_ids_by_edge: dict[str, tuple[str, ...]]
+    strict_descendant_branch_ids_by_edge: dict[str, tuple[str, ...]]
 
 
 def _as_object_array(values, name: str, batch_size: int) -> np.ndarray:
@@ -128,6 +142,7 @@ def build_tree_credit_index(
 
     direct: dict[str, list[str]] = defaultdict(list)
     descendants: dict[str, list[str]] = defaultdict(list)
+    strict_descendants: dict[str, list[str]] = defaultdict(list)
     root_rows_by_parent: dict[str, list[int]] = defaultdict(list)
     for occurrence_id, row in root_row_by_occurrence.items():
         root_rows_by_parent[str(tree_parent_root_ids[row])].append(row)
@@ -139,8 +154,11 @@ def build_tree_credit_index(
         parent_root = branch_parent_root_by_id[branch_id]
         origin_step = branch_origin_step_by_id[branch_id]
         for row in root_rows_by_parent[parent_root]:
-            if int(step_indices[row]) <= origin_step:
+            edge_step = int(step_indices[row])
+            if edge_step <= origin_step:
                 descendants[str(occurrence_ids[row])].append(branch_id)
+            if edge_step < origin_step:
+                strict_descendants[str(occurrence_ids[row])].append(branch_id)
 
     order_key = lambda branch_id: (
         branch_origin_step_by_id[branch_id], branch_id
@@ -159,6 +177,10 @@ def build_tree_credit_index(
         descendant_branch_ids_by_edge={
             edge: tuple(sorted(branches, key=order_key))
             for edge, branches in descendants.items()
+        },
+        strict_descendant_branch_ids_by_edge={
+            edge: tuple(sorted(branches, key=order_key))
+            for edge, branches in strict_descendants.items()
         },
     )
 
@@ -321,11 +343,11 @@ def compute_credit_diagnostics(
         conflict = float(bool(torch.any(values > epsilon) and torch.any(values < -epsilon)))
         row_sources = {str(sources[row]) for row in rows}
         conflicts["all"].append(conflict)
-        if row_sources == {"root"}:
+        if row_sources.issubset({"root", "flat_root"}):
             conflicts["natural_only"].append(conflict)
-        if "branch_origin" in row_sources:
+        if row_sources.intersection({"branch_origin", "flat_branch_origin"}):
             conflicts["with_branch_origin"].append(conflict)
-        if "branch_suffix" in row_sources:
+        if row_sources.intersection({"branch_suffix", "flat_branch_suffix"}):
             conflicts["with_branch_suffix"].append(conflict)
 
     imbalance_ratios = []
@@ -359,11 +381,19 @@ def compute_credit_diagnostics(
         "within_action_return_variance_mean": mean(return_variances),
         "occurrence_local_within_action_variance_mean": mean(occurrence_variances),
         "selected_local_within_action_variance_mean": mean(selected_variances),
-        "branch_created_evidence_share": float(
-            np.mean([str(source).startswith("branch_") for source in sources])
-        ),
-        "branch_origin_evidence_share": float(np.mean(sources == "branch_origin")),
-        "branch_suffix_evidence_share": float(np.mean(sources == "branch_suffix")),
+        "branch_created_evidence_share": float(np.mean([
+            str(source).startswith("branch_")
+            or str(source).startswith("flat_branch_")
+            for source in sources
+        ])),
+        "branch_origin_evidence_share": float(np.mean([
+            str(source) in {"branch_origin", "flat_branch_origin"}
+            for source in sources
+        ])),
+        "branch_suffix_evidence_share": float(np.mean([
+            str(source) in {"branch_suffix", "flat_branch_suffix"}
+            for source in sources
+        ])),
     }
     baseline_variance = result["occurrence_local_within_action_variance_mean"]
     result["within_action_variance_reduction_fraction"] = (
@@ -501,6 +531,260 @@ def _current_local_scores(
         remove_std=remove_std,
     )
     return tokens, _occurrence_values(tokens, response_mask)
+
+
+def compute_bace_physical_tree_credit_advantage(
+    *,
+    token_level_rewards: torch.Tensor,
+    step_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    anchor_obs: np.ndarray,
+    task_ids: np.ndarray,
+    traj_ids: np.ndarray,
+    occurrence_ids: np.ndarray,
+    source_types: np.ndarray,
+    leaf_ids: np.ndarray,
+    step_indices: np.ndarray,
+    tree_origin_occurrence_ids: np.ndarray,
+    tree_parent_root_ids: np.ndarray,
+    adjustment_padding_mask: np.ndarray | None = None,
+    credit_mode: str,
+    gamma: float = 1.0,
+    epsilon: float = 1e-6,
+    step_advantage_w: float = 1.0,
+    mode: str = "mean_norm",
+    enable_similarity: bool = False,
+    similarity_thresh: float = 0.95,
+    compute_mean_std_cross_steps: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
+    """Compute C0.5/C4/C8 on the complete production C0 support.
+
+    Unlike C1--C3 this path never removes copied origins or batching copies.
+    Tree relationships are built from logical rollout rows and any adjustment
+    copies receive the same override as their source occurrence identity.
+    """
+    try:
+        selected_mode = BaceCreditMode(credit_mode)
+    except ValueError as exc:
+        raise ValueError(f"Unknown BACE credit mode: {credit_mode}") from exc
+    supported = {
+        BaceCreditMode.C0_5_ORIGIN_FAMILY_LOCAL_MEAN,
+        BaceCreditMode.C4_MACRO_STRICT_ANCESTOR,
+        BaceCreditMode.C8_MACRO_LOCAL_STRICT_ANCESTOR,
+    }
+    if selected_mode not in supported:
+        raise ValueError(f"Physical tree credit does not implement {credit_mode}")
+    if not 0.0 <= float(gamma) <= 1.0:
+        raise ValueError("gamma must be in [0, 1]")
+
+    batch_size, response_length = response_mask.shape
+    if token_level_rewards.shape != response_mask.shape:
+        raise ValueError("token_level_rewards and response_mask must have the same shape")
+    if step_rewards.shape != (batch_size,):
+        raise ValueError("step_rewards must have one value per physical occurrence")
+    anchor_obs = _as_object_array(anchor_obs, "anchor_obs", batch_size)
+    task_ids = _as_object_array(task_ids, "task_id", batch_size)
+    traj_ids = _as_object_array(traj_ids, "traj_id", batch_size)
+    occurrence_ids = _as_object_array(occurrence_ids, "occurrence_id", batch_size)
+    source_types = _as_object_array(source_types, "source_type", batch_size)
+    leaf_ids = _as_object_array(leaf_ids, "leaf_id", batch_size)
+    step_indices = np.asarray(step_indices)
+    tree_origin_occurrence_ids = _as_object_array(
+        tree_origin_occurrence_ids, "tree_origin_occurrence_id", batch_size
+    )
+    tree_parent_root_ids = _as_object_array(
+        tree_parent_root_ids, "tree_parent_root_id", batch_size
+    )
+    if adjustment_padding_mask is None:
+        adjustment_padding_mask = np.zeros(batch_size, dtype=bool)
+    adjustment_padding_mask = np.asarray(adjustment_padding_mask, dtype=bool)
+
+    remove_std = _normalization_mode(mode)
+    _, macro_c0 = _current_stable_macro(
+        token_level_rewards,
+        response_mask,
+        task_ids,
+        traj_ids,
+        epsilon=epsilon,
+        remove_std=remove_std,
+        compute_mean_std_cross_steps=compute_mean_std_cross_steps,
+    )
+    _, local_c0 = _current_local_scores(
+        step_rewards,
+        response_mask,
+        anchor_obs,
+        task_ids,
+        epsilon=epsilon,
+        remove_std=remove_std,
+        enable_similarity=enable_similarity,
+        similarity_thresh=similarity_thresh,
+    )
+    tree = build_tree_credit_index(
+        source_types=source_types,
+        occurrence_ids=occurrence_ids,
+        traj_ids=traj_ids,
+        leaf_ids=leaf_ids,
+        step_indices=step_indices,
+        tree_origin_occurrence_ids=tree_origin_occurrence_ids,
+        tree_parent_root_ids=tree_parent_root_ids,
+        adjustment_padding_mask=adjustment_padding_mask,
+    )
+
+    rows_by_occurrence: dict[str, list[int]] = defaultdict(list)
+    for row, occurrence_id in enumerate(occurrence_ids):
+        rows_by_occurrence[str(occurrence_id)].append(row)
+
+    macro_selected = macro_c0.clone()
+    local_selected = local_c0.clone()
+    g_override = step_rewards.clone()
+    family_id = np.asarray([""] * batch_size, dtype=object)
+    family_size = np.zeros(batch_size, dtype=np.int32)
+    family_mean = local_c0.clone()
+    strict_ids: list[tuple[str, ...]] = [tuple() for _ in range(batch_size)]
+    macro_candidates: list[tuple[float, ...]] = [tuple() for _ in range(batch_size)]
+    g_candidates: list[tuple[float, ...]] = [tuple() for _ in range(batch_size)]
+    branch_deltas: list[tuple[float, ...]] = [tuple() for _ in range(batch_size)]
+    g_branch_deltas: list[tuple[float, ...]] = [tuple() for _ in range(batch_size)]
+    g_branch_origins: list[tuple[float, ...]] = [tuple() for _ in range(batch_size)]
+    g_natural_origins: list[tuple[float, ...]] = [tuple() for _ in range(batch_size)]
+    g_distances: list[tuple[int, ...]] = [tuple() for _ in range(batch_size)]
+    g_discounts: list[tuple[float, ...]] = [tuple() for _ in range(batch_size)]
+
+    if selected_mode is BaceCreditMode.C0_5_ORIGIN_FAMILY_LOCAL_MEAN:
+        for origin_id, branches in tree.direct_branch_ids_by_edge.items():
+            logical_ids = [origin_id] + [
+                str(occurrence_ids[tree.branch_origin_row_by_id[branch_id]])
+                for branch_id in branches
+            ]
+            rows = [row for item in logical_ids for row in rows_by_occurrence[item]]
+            if not rows:
+                continue
+            row_index = torch.as_tensor(rows, device=local_c0.device)
+            mean_value = local_c0[row_index].mean()
+            local_selected[row_index] = mean_value
+            for row in rows:
+                family_id[row] = origin_id
+                family_size[row] = len(rows)
+                family_mean[row] = mean_value
+    else:
+        for origin_occurrence, physical_row in tree.root_row_by_occurrence.items():
+            # A concrete occurrence selected as any branch origin retains its
+            # complete C0 semantics, even if it is also a strict ancestor of a
+            # later branch in the same natural trajectory.
+            if origin_occurrence in tree.direct_branch_ids_by_edge:
+                continue
+            branches = tree.strict_descendant_branch_ids_by_edge.get(
+                origin_occurrence, ()
+            )
+            if not branches:
+                continue
+            macro_values = [macro_c0[physical_row]]
+            local_values = [step_rewards[physical_row]]
+            macro_delta_values: list[float] = []
+            local_delta_values: list[float] = []
+            branch_g_values: list[float] = []
+            natural_g_values: list[float] = []
+            distances: list[int] = []
+            discounts: list[float] = []
+            for branch_id in branches:
+                branch_row = tree.branch_origin_row_by_id[branch_id]
+                natural_origin_row = tree.root_row_by_occurrence[
+                    tree.branch_origin_occurrence_by_id[branch_id]
+                ]
+                macro_delta = macro_c0[branch_row] - macro_c0[natural_origin_row]
+                macro_values.append(macro_c0[physical_row] + macro_delta)
+                macro_delta_values.append(float(macro_delta.item()))
+                distance = tree.branch_origin_step_by_id[branch_id] - int(
+                    step_indices[physical_row]
+                )
+                discount = float(gamma) ** distance
+                local_delta = step_rewards[branch_row] - step_rewards[natural_origin_row]
+                local_values.append(step_rewards[physical_row] + discount * local_delta)
+                local_delta_values.append(float(local_delta.item()))
+                branch_g_values.append(float(step_rewards[branch_row].item()))
+                natural_g_values.append(float(step_rewards[natural_origin_row].item()))
+                distances.append(distance)
+                discounts.append(discount)
+            new_macro = torch.stack(macro_values).mean()
+            new_g = torch.stack(local_values).mean()
+            for row in rows_by_occurrence[origin_occurrence]:
+                macro_selected[row] = new_macro
+                if selected_mode is BaceCreditMode.C8_MACRO_LOCAL_STRICT_ANCESTOR:
+                    g_override[row] = new_g
+                strict_ids[row] = tuple(branches)
+                macro_candidates[row] = tuple(float(value.item()) for value in macro_values)
+                g_candidates[row] = tuple(float(value.item()) for value in local_values)
+                branch_deltas[row] = tuple(macro_delta_values)
+                g_branch_deltas[row] = tuple(local_delta_values)
+                g_branch_origins[row] = tuple(branch_g_values)
+                g_natural_origins[row] = tuple(natural_g_values)
+                g_distances[row] = tuple(distances)
+                g_discounts[row] = tuple(discounts)
+        if selected_mode is BaceCreditMode.C8_MACRO_LOCAL_STRICT_ANCESTOR:
+            _, local_selected = _current_local_scores(
+                g_override,
+                response_mask,
+                anchor_obs,
+                task_ids,
+                epsilon=epsilon,
+                remove_std=remove_std,
+                enable_similarity=enable_similarity,
+                similarity_thresh=similarity_thresh,
+            )
+
+    occurrence_selected = macro_selected + step_advantage_w * local_selected
+    token_scores = occurrence_selected.unsqueeze(-1).expand(
+        batch_size, response_length
+    ) * response_mask
+    metadata = {
+        "bace_credit_mode": np.asarray([selected_mode.value] * batch_size, dtype=object),
+        "bace_root_id": tree_parent_root_ids.copy(),
+        "bace_branch_id": np.asarray([
+            str(traj_ids[row]) if str(source_types[row]).startswith("branch_") else ""
+            for row in range(batch_size)
+        ], dtype=object),
+        "bace_natural_origin_occurrence_id": tree_origin_occurrence_ids.copy(),
+        "bace_macro_c0": macro_c0.detach().cpu().numpy(),
+        "bace_local_c0": local_c0.detach().cpu().numpy(),
+        "bace_origin_family_id": family_id,
+        "bace_origin_family_size": family_size,
+        "bace_local_family_mean": family_mean.detach().cpu().numpy(),
+        "bace_local_c0_5": local_selected.detach().cpu().numpy(),
+        "bace_strict_descendant_branch_ids": _one_dimensional_object_array(strict_ids),
+        "bace_macro_branch_delta": _one_dimensional_object_array(branch_deltas),
+        "bace_macro_candidates": _one_dimensional_object_array(macro_candidates),
+        "bace_macro_c4": macro_selected.detach().cpu().numpy(),
+        "bace_g_c0": step_rewards.detach().cpu().numpy(),
+        "bace_g_candidates": _one_dimensional_object_array(g_candidates),
+        "bace_g_branch_delta": _one_dimensional_object_array(g_branch_deltas),
+        "bace_branch_origin_g": _one_dimensional_object_array(g_branch_origins),
+        "bace_natural_origin_g": _one_dimensional_object_array(g_natural_origins),
+        "bace_g_distance": _one_dimensional_object_array(g_distances),
+        "bace_g_gamma_discount": _one_dimensional_object_array(g_discounts),
+        "bace_g_c8_override": g_override.detach().cpu().numpy(),
+        "bace_local_c8": local_selected.detach().cpu().numpy(),
+    }
+    changed_macro = torch.abs(macro_selected - macro_c0) > epsilon
+    changed_local = torch.abs(local_selected - local_c0) > epsilon
+    diagnostics = {
+        "tree_credit_physical_occurrences": float(batch_size),
+        "tree_credit_unique_occurrences": float(len({str(value) for value in occurrence_ids})),
+        "tree_credit_copied_origins_removed": 0.0,
+        "tree_credit_adjustment_padding_removed": 0.0,
+        "tree_credit_adjustment_padding_rows": float(adjustment_padding_mask.sum()),
+        "tree_credit_macro_prefix_edges_affected": float(changed_macro.sum().item()),
+        "tree_credit_local_rows_affected": float(changed_local.sum().item()),
+        "tree_credit_invalid_penalty_is_edge_local": 1.0,
+    }
+    components: dict[str, object] = {
+        "macro": macro_selected,
+        "local": local_selected,
+        "occurrence": occurrence_selected,
+        "metadata": metadata,
+        "tree_diagnostics": diagnostics,
+        "branch_evidence": [],
+    }
+    return token_scores, token_scores, components
 
 
 def compute_bace_tree_credit_advantage(
