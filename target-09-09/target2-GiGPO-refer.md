@@ -83,13 +83,13 @@ checkpoint:      不保存，且不恢复旧 checkpoint
 
 训练参数保持原始 GiGPO 口径：Qwen2.5-1.5B-Instruct 全参数 FSDP、train/val batch `16/128`、每任务 8 个 rollout、horizon 50、response 512、LR `1e-6`、PPO mini-batch 256、actor/logprob/ref micro-batch per GPU 均为 32、TP=2、rollout memory utilization 0.6、KL=0.01、gamma=0.95、开始前验证一次且每 5 step 验证、共 150 epoch。当前 16 行训练 parquet 与 train batch 16 对应 150 个 optimizer update。
 
-完整 wrapper 只额外固定本地模型/数据、`env.seed=0`、独立 run 名、`trainer.save_freq=-1` 与 `trainer.resume_mode=disable`。因此作业若被取消、节点故障或超时，不能从中间 step 恢复，必须从 seed 0 重跑。
+完整 wrapper 只额外固定本地模型/数据、`env.seed=0`、独立 run 名、`trainer.logger=['console','tensorboard']`、`trainer.save_freq=-1` 与 `trainer.resume_mode=disable`。因此作业若被取消、节点故障或超时，不能从中间 step 恢复，必须从 seed 0 重跑。
 
 ## 5. 为什么申请 240 GiB RAM
 
 第一次完整运行 `3790004` 在 step 65 后失败，Slurm 状态是 `OUT_OF_MEMORY`。这不是 CUDA 显存错误：作业未显式申请内存时只得到 162.5 GiB 主存，Slurm 记录的 `MaxRSS` 为 170.4 GiB，并确认有 `oom_kill event=1`。所以当前脚本只增加 `#SBATCH --mem=240G`，不修改任何 GiGPO 算法或 batch 参数。
 
-当前重提作业号为 `3862542`；该号码仅用于本次追踪，其他使用者运行 `sbatch` 后应记录自己的作业号。
+此前重提作业 `3862542` 已删除其输出后废弃；该 run 曾把 W&B 输出写到旧 HPCWORK 并触发配额错误。当前 wrapper 已将全部可写输出切到 rwth2089，并使用 TensorBoard，不使用 W&B。
 
 ## 6. 日志、监控与成功判据
 
@@ -112,10 +112,10 @@ tail -f /hpcwork/xsz96350/fu_project/work-BACE/experiments/gigpo-alfworld-upstre
 /hpcwork/xsz96350/fu_project/work-BACE/experiments/gigpo-alfworld-upstream-full/slurm/
 ```
 
-W&B 设为 offline，本地运行记录在：
+TensorBoard 事件文件位于：
 
 ```text
-/hpcwork/xsz96350/fu_project/work-BACE/experiments/gigpo-alfworld-upstream-full/wandb/<jobid>/
+/hpcwork/rwth2089/xsz96350/work-BACE/experiments/gigpo-alfworld-upstream-full/tensorboard/<jobid>/
 ```
 
 重点指标是 `training/global_step`、`episode/success_rate`、`val/success_rate`、`timing_s/step`、`perf/max_memory_*`。完整成功的最低条件：作业 `COMPLETED (0:0)`，最后出现 `training/global_step:150`，并完成 step 150 validation。

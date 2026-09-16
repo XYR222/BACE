@@ -16,7 +16,15 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
+# Accept only a complete veRL repository, not an arbitrary submit directory.
+if [[ -n "${BACE_REPO_ROOT:-}" ]]; then
+    REPO_ROOT=$(cd "${BACE_REPO_ROOT}" && pwd -P)
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/verl/trainer/main_ppo.py" ]]; then
+    REPO_ROOT=$(cd "${SLURM_SUBMIT_DIR}" && pwd -P)
+else
+    REPO_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd -P)
+fi
+[[ -f "${REPO_ROOT}/verl/trainer/main_ppo.py" ]] || { echo "Invalid veRL repository: ${REPO_ROOT}" >&2; exit 2; }
 WORK_BACE_ROOT=$(cd "${REPO_ROOT}/.." && pwd)
 WORKSPACE_ROOT=$(cd "${WORK_BACE_ROOT}/.." && pwd)
 EXP_ROOT=${WORK_BACE_ROOT}/experiments/alfworld-qwen2.5-1.5b-exact
@@ -39,6 +47,11 @@ RUN_NAME=${BACE_RUN_NAME:-bace_c0_opt_s${SEED}_c${COMPETENCE_THRESHOLD}_w${STEP_
 SAVE_FREQ=${SAVE_FREQ:-5}
 MAX_CHECKPOINTS=${MAX_CHECKPOINTS:-2}
 MILESTONE_CHECKPOINT_STEPS=${MILESTONE_CHECKPOINT_STEPS:-10,75,100,140}
+GPU_COUNT=${BACE_GPU_COUNT:-2}
+ROLLOUT_TP=${BACE_ROLLOUT_TP:-${GPU_COUNT}}
+ACTOR_MICRO_BATCH=${BACE_ACTOR_MICRO_BATCH:-32}
+LOGPROB_MICRO_BATCH=${BACE_LOGPROB_MICRO_BATCH:-32}
+ROLLOUT_GPU_MEMORY_UTILIZATION=${BACE_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.6}
 
 [[ "${SEED}" =~ ^[0-9]+$ ]]
 [[ "${COMPETENCE_THRESHOLD}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]
@@ -47,6 +60,9 @@ MILESTONE_CHECKPOINT_STEPS=${MILESTONE_CHECKPOINT_STEPS:-10,75,100,140}
 [[ "${TARGET_STEP}" =~ ^[0-9]+$ ]] && (( TARGET_STEP >= 1 && TARGET_STEP <= 150 ))
 [[ "${RUN_NAME}" =~ ^[A-Za-z0-9_.-]+$ ]]
 [[ "${MAX_CHECKPOINTS}" =~ ^(1|2)$ ]]
+[[ "${GPU_COUNT}" =~ ^[12]$ && "${ROLLOUT_TP}" =~ ^[12]$ ]]
+(( ROLLOUT_TP <= GPU_COUNT ))
+[[ "${ACTOR_MICRO_BATCH}" =~ ^[1-9][0-9]*$ && "${LOGPROB_MICRO_BATCH}" =~ ^[1-9][0-9]*$ ]]
 if [[ "${MILESTONE_CHECKPOINT_STEPS}" == none ]]; then
     MILESTONE_ENABLED=false
 else
@@ -58,13 +74,19 @@ ARTIFACT_DIR=${EXP_ROOT}/bace_artifacts/${RUN_NAME}
 CHECKPOINT_DIR=${EXP_ROOT}/checkpoints/${RUN_NAME}
 ROLLOUT_DIR=${EXP_ROOT}/rollout_trajectories/${RUN_NAME}
 TB_DIR=${EXP_ROOT}/tensorboard/${RUN_NAME}
+export TENSORBOARD_DIR=${TB_DIR}
+WANDB_ROOT=${EXP_ROOT}/wandb/${RUN_NAME}
+export WANDB_DIR=${WANDB_ROOT}/runs
+export WANDB_DATA_DIR=${WANDB_ROOT}/data
+export WANDB_CACHE_DIR=${WANDB_ROOT}/cache
+export WANDB_ARTIFACT_DIR=${WANDB_ROOT}/artifacts
 METADATA_DIR=${EXP_ROOT}/run_metadata/${RUN_NAME}/${SLURM_JOB_ID:-local}
 REPORT_DIR=${EXP_ROOT}/trace_validation/${RUN_NAME}
 LOG_FILE=${EXP_ROOT}/logs/${RUN_NAME}/${SLURM_JOB_ID:-local}.log
 MILESTONE_DIR=${EXP_ROOT}/preserved_checkpoints/${RUN_NAME}
 
 CONDA_BASE=${CONDA_BASE:-${HOME}/miniforge3}
-VERL_AGENT_ENV=${VERL_AGENT_ENV:-${WORKSPACE_ROOT}/verl-agent}
+VERL_AGENT_ENV=${WORKSPACE_ROOT}/verl-agent
 module purge
 module load GCCcore/13.3.0
 module load CUDA/12.8.0
@@ -77,8 +99,13 @@ export OMP_NUM_THREADS=1 OMP_THREAD_LIMIT=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREA
 export NUMEXPR_NUM_THREADS=1 NUMEXPR_MAX_THREADS=1 VECLIB_MAXIMUM_THREADS=1 RAYON_NUM_THREADS=1 MALLOC_ARENA_MAX=2
 unset ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES LOCAL_RANK LOCAL_WORLD_SIZE RANK WORLD_SIZE MASTER_ADDR MASTER_PORT
 
+# TensorBoard uses a relative tensorboard_log directory.  Enter the repository,
+# where that path is linked to the rwth2089 experiment storage volume.
+cd "${REPO_ROOT}"
 for path in "${MODEL_PATH}" "${TRAIN_FILE}" "${VAL_FILE}" "${ALFWORLD_DATA}"; do [[ -e "${path}" ]] || { echo "Missing ${path}" >&2; exit 2; }; done
-mkdir -p "${ARTIFACT_DIR}" "${CHECKPOINT_DIR}" "${ROLLOUT_DIR}" "${TB_DIR}" "${METADATA_DIR}" "${REPORT_DIR}" "$(dirname "${LOG_FILE}")"
+mkdir -p "${ARTIFACT_DIR}" "${CHECKPOINT_DIR}" "${ROLLOUT_DIR}" "${TB_DIR}" \
+    "${WANDB_DIR}" "${WANDB_DATA_DIR}" "${WANDB_CACHE_DIR}" "${WANDB_ARTIFACT_DIR}" \
+    "${METADATA_DIR}" "${REPORT_DIR}" "$(dirname "${LOG_FILE}")"
 [[ "${MILESTONE_ENABLED}" == true ]] && mkdir -p "${MILESTONE_DIR}"
 
 # Independent node-local Ray state: safe if two 2-GPU jobs share a 4-GPU node.
@@ -116,13 +143,16 @@ cmd=(python3 -m verl.trainer.main_ppo
     trainer.save_freq="${SAVE_FREQ}" trainer.total_training_steps="${TARGET_STEP}" trainer.default_local_dir="${CHECKPOINT_DIR}" trainer.rollout_data_dir="${ROLLOUT_DIR}" trainer.resume_mode=auto trainer.max_actor_ckpt_to_keep="${MAX_CHECKPOINTS}"
     ray_init.num_cpus=32 +ray_init._temp_dir="${RAY_TMP}/ray" +ray_init.include_dashboard=False)
 [[ "${MILESTONE_ENABLED}" == true ]] && cmd+=("trainer.milestone_checkpoint_steps=[${MILESTONE_CHECKPOINT_STEPS}]" trainer.milestone_checkpoint_dir="${MILESTONE_DIR}")
+if [[ "${GPU_COUNT}" != 2 || "${ROLLOUT_TP}" != 2 || "${ACTOR_MICRO_BATCH}" != 32 || "${LOGPROB_MICRO_BATCH}" != 32 || "${ROLLOUT_GPU_MEMORY_UTILIZATION}" != 0.6 ]]; then
+    cmd+=(actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${ACTOR_MICRO_BATCH}" actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${LOGPROB_MICRO_BATCH}" actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${LOGPROB_MICRO_BATCH}" actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP}" actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}" trainer.n_gpus_per_node="${GPU_COUNT}")
+fi
 
 printf '%q ' "${cmd[@]}" > "${METADATA_DIR}/resolved_command.sh"; printf '\n' >> "${METADATA_DIR}/resolved_command.sh"
 printf 'method=C0\nseed=%s\ncompetence_threshold=%s\nstep_advantage_w=%s\nbatch_erv_threshold=%s\ncapacity_correction_batch_size=%s\nscheduling_profile=optimized\ncredit_mode=current\n' "${SEED}" "${COMPETENCE_THRESHOLD}" "${STEP_ADVANTAGE_W}" "${BATCH_ERV_THRESHOLD}" "${CAPACITY_CORRECTION_BATCH_SIZE}" > "${METADATA_DIR}/run_metadata.txt"
 (cd "${REPO_ROOT}" && find recipe/bace_gigpo verl/trainer agent_system examples/bace_gigpo -type f \( -name '*.py' -o -name '*.yaml' -o -name '*.sh' -o -name '*.sbatch' \) -print0 | sort -z | xargs -0 sha256sum) > "${METADATA_DIR}/source_manifest.sha256"
 
 [[ "${DRY_RUN:-0}" == 1 ]] && { echo "DRY_RUN: ${METADATA_DIR}/resolved_command.sh"; exit 0; }
-python3 ${WORKSPACE_ROOT}/work-BACE/deploy/gpu/check_gpu_environment.py --expected-gpus 2 --model-path "${MODEL_PATH}" --alfworld-data "${ALFWORLD_DATA}" --output "${METADATA_DIR}/preflight.json"
+python3 ${WORKSPACE_ROOT}/work-BACE/deploy/gpu/check_gpu_environment.py --expected-gpus "${GPU_COUNT}" --model-path "${MODEL_PATH}" --alfworld-data "${ALFWORLD_DATA}" --output "${METADATA_DIR}/preflight.json"
 nvidia-smi topo -m > "${METADATA_DIR}/gpu_topology.txt"
 set +e; "${cmd[@]}" 2>&1 | tee -a "${LOG_FILE}"; status=${PIPESTATUS[0]}; set -e
 printf 'train_exit_code=%s\n' "${status}" >> "${METADATA_DIR}/run_metadata.txt"
