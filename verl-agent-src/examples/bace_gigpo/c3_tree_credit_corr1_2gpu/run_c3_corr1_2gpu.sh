@@ -13,16 +13,22 @@
 #SBATCH --output=slurm-%x-%j.out
 #SBATCH --error=slurm-%x-%j.err
 set -euo pipefail
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); REPO=$(cd "${SCRIPT_DIR}/../../.." && pwd); WORK_BACE=$(cd "${REPO}/.." && pwd); ROOT=$(cd "${WORK_BACE}/.." && pwd); EXP=${WORK_BACE}/experiments/alfworld-qwen2.5-1.5b-exact
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [[ -n "${BACE_REPO_ROOT:-}" ]]; then REPO=$(cd "${BACE_REPO_ROOT}" && pwd -P); elif [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/verl/trainer/main_ppo.py" ]]; then REPO=$(cd "${SLURM_SUBMIT_DIR}" && pwd -P); else REPO=$(cd "${SCRIPT_DIR}/../../.." && pwd -P); fi
+[[ -f "${REPO}/verl/trainer/main_ppo.py" ]] || { echo "Invalid veRL repository: ${REPO}" >&2; exit 2; }
+WORK_BACE=$(cd "${REPO}/.." && pwd); ROOT=$(cd "${WORK_BACE}/.." && pwd); EXP=${WORK_BACE}/experiments/alfworld-qwen2.5-1.5b-exact
 MODEL=${ROOT}/model_down/model/Qwen2.5-1.5B-Instruct; TRAIN=${ROOT}/data/text/train.parquet; VAL=${ROOT}/data/text/test.parquet
-SEED=${BACE_SEED:-0}; TARGET=${TARGET_STEP:-150}; RUN=${BACE_RUN_NAME:-bace_c3_corr1_seed${SEED}}; SAVE=${SAVE_FREQ:-5}; KEEP=${MAX_CHECKPOINTS:-2}
+SEED=${BACE_SEED:-0}; TARGET=${TARGET_STEP:-150}; RUN=${BACE_RUN_NAME:-bace_c3_corr1_seed${SEED}}; SAVE=${SAVE_FREQ:-5}; KEEP=${MAX_CHECKPOINTS:-2}; GPU_COUNT=${BACE_GPU_COUNT:-2}; ROLLOUT_TP=${BACE_ROLLOUT_TP:-${GPU_COUNT}}; ACTOR_MICRO_BATCH=${BACE_ACTOR_MICRO_BATCH:-32}; LOGPROB_MICRO_BATCH=${BACE_LOGPROB_MICRO_BATCH:-32}; ROLLOUT_GPU_MEMORY_UTILIZATION=${BACE_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.6}
 [[ "${SEED}" =~ ^[0-9]+$ && "${TARGET}" =~ ^[0-9]+$ && "${RUN}" =~ ^[A-Za-z0-9_.-]+$ && "${KEEP}" =~ ^(1|2)$ ]]
+[[ "${GPU_COUNT}" =~ ^[12]$ && "${ROLLOUT_TP}" =~ ^[12]$ ]] && (( ROLLOUT_TP <= GPU_COUNT )) && [[ "${ACTOR_MICRO_BATCH}" =~ ^[1-9][0-9]*$ && "${LOGPROB_MICRO_BATCH}" =~ ^[1-9][0-9]*$ ]]
 ART=${EXP}/bace_artifacts/${RUN}; CKPT=${EXP}/checkpoints/${RUN}; ROLL=${EXP}/rollout_trajectories/${RUN}; TB=${EXP}/tensorboard/${RUN}; META=${EXP}/run_metadata/${RUN}/${SLURM_JOB_ID:-local}; REPORT=${EXP}/trace_validation/${RUN}; LOG=${EXP}/logs/${RUN}/${SLURM_JOB_ID:-local}.log
-CONDA_BASE=${CONDA_BASE:-${HOME}/miniforge3}; VERL_AGENT_ENV=${VERL_AGENT_ENV:-${ROOT}/verl-agent}
+export TENSORBOARD_DIR=${TB}
+CONDA_BASE=${CONDA_BASE:-${HOME}/miniforge3}; VERL_AGENT_ENV=${ROOT}/verl-agent
 module purge; module load GCCcore/13.3.0; module load CUDA/12.8.0; source "${CONDA_BASE}/etc/profile.d/conda.sh"; conda activate "${VERL_AGENT_ENV}"
 unset VLLM_ATTENTION_BACKEND; export ALFWORLD_DATA=${ALFWORLD_DATA:-${HOME}/.cache/alfworld} HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 PYTHONNOUSERSITE=1 TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=1 OMP_THREAD_LIMIT=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 NUMEXPR_MAX_THREADS=1 VECLIB_MAXIMUM_THREADS=1 RAYON_NUM_THREADS=1 MALLOC_ARENA_MAX=2
 unset ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES LOCAL_RANK LOCAL_WORLD_SIZE RANK WORLD_SIZE MASTER_ADDR MASTER_PORT
+cd "${REPO}"
 for p in "${MODEL}" "${TRAIN}" "${VAL}" "${ALFWORLD_DATA}"; do [[ -e "${p}" ]] || { echo "Missing ${p}" >&2; exit 2; }; done
 mkdir -p "${ART}" "${CKPT}" "${ROLL}" "${TB}" "${META}" "${REPORT}" "$(dirname "${LOG}")"
 RTMP=/tmp/bace_ray_${USER}_${SLURM_JOB_ID:-local_c3_corr1}; mkdir -p "${RTMP}/ray" "${RTMP}/hf"; export TMPDIR=${RTMP} RAY_TMPDIR=${RTMP} HF_DATASETS_CACHE=${RTMP}/hf

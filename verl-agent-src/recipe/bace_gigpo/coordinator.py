@@ -29,7 +29,9 @@ def _make_request(index, task_id, branch_idx, anchor, action, origin):
         target_turn=event.step_index,
         parsed_action_prefix=tuple(item.parsed_environment_action for item in prefix),
         prefix_observations=tuple(item.pre_action_observation for item in prefix),
-        expected_anchor_key=anchor.anchor_key,
+        # Similarity anchors use a cluster representative for allocation, but
+        # replay must reconstruct the selected concrete natural occurrence.
+        expected_anchor_key=event.pre_action_observation,
         expected_observation=event.pre_action_observation,
         expected_action_set=event.admissible_actions,
         selected_canonical_action=action,
@@ -316,6 +318,9 @@ class ExactBatchErvCoordinator:
         tie_break_identity_mode: str = "legacy_uuid",
         pairwise_mode: str = "full",
         pairwise_batch_size: int = 2,
+        anchor_similarity_enabled: bool = False,
+        anchor_similarity_threshold: float = 0.9,
+        allow_initial_search_anchor: bool = False,
     ):
         self.prior_strength = float(prior_strength)
         self.invalid_action_mode = invalid_action_mode
@@ -324,6 +329,9 @@ class ExactBatchErvCoordinator:
                 "tie_break_identity_mode must be legacy_uuid or stable_v1"
             )
         self.tie_break_identity_mode = tie_break_identity_mode
+        self.anchor_similarity_enabled = bool(anchor_similarity_enabled)
+        self.anchor_similarity_threshold = float(anchor_similarity_threshold)
+        self.allow_initial_search_anchor = bool(allow_initial_search_anchor)
         if pairwise_mode not in {"full", "fixed", "stopping"}:
             raise ValueError("pairwise_mode must be full, fixed, or stopping")
         if pairwise_batch_size != 2:
@@ -408,6 +416,9 @@ class ExactBatchErvCoordinator:
             roots,
             invalid_action_mode=self.invalid_action_mode,
             tie_break_identity_mode=self.tie_break_identity_mode,
+            anchor_similarity_enabled=self.anchor_similarity_enabled,
+            anchor_similarity_threshold=self.anchor_similarity_threshold,
+            allow_initial_search_anchor=self.allow_initial_search_anchor,
         )
         anchors_by_id = self.index._anchors
         self._pending_requests = []

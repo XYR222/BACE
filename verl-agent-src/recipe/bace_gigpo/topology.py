@@ -289,6 +289,9 @@ class ExactBatchTopologyPlanner:
         invalid_action_mode: str = "strict_identity",
         tie_break_identity_mode: str = "legacy_uuid",
         capacity_correction_batch_size: int = 1,
+        anchor_similarity_enabled: bool = False,
+        anchor_similarity_threshold: float = 0.9,
+        allow_initial_search_anchor: bool = False,
     ):
         if not 1 <= min_natural_roots <= total_budget:
             raise ValueError("min_natural_roots must be in [1, total_budget]")
@@ -306,6 +309,9 @@ class ExactBatchTopologyPlanner:
                 "tie_break_identity_mode must be legacy_uuid or stable_v1"
             )
         self.tie_break_identity_mode = tie_break_identity_mode
+        self.anchor_similarity_enabled = bool(anchor_similarity_enabled)
+        self.anchor_similarity_threshold = float(anchor_similarity_threshold)
+        self.allow_initial_search_anchor = bool(allow_initial_search_anchor)
         self.engine = ExactBatchErvEngine(
             max_branches_per_anchor=max_branches_per_anchor,
             threshold=batch_erv_threshold,
@@ -353,6 +359,9 @@ class ExactBatchTopologyPlanner:
             roots,
             invalid_action_mode=self.invalid_action_mode,
             tie_break_identity_mode=self.tie_break_identity_mode,
+            anchor_similarity_enabled=self.anchor_similarity_enabled,
+            anchor_similarity_threshold=self.anchor_similarity_threshold,
+            allow_initial_search_anchor=self.allow_initial_search_anchor,
         )
         designs = {}
         for anchor in index.anchors_for_task(state.task_id):

@@ -148,6 +148,19 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         self.tie_break_identity_mode = str(
             bace_config.get("tie_break_identity_mode", "legacy_uuid")
         )
+        self.anchor_similarity_enabled = bool(
+            bace_config.get("anchor_similarity_enabled", False)
+        )
+        self.anchor_similarity_threshold = float(
+            bace_config.get("anchor_similarity_threshold", 0.9)
+        )
+        self.allow_initial_search_anchor = bool(
+            bace_config.get("allow_initial_search_anchor", False)
+        )
+        if self.anchor_similarity_enabled and not 0.0 < self.anchor_similarity_threshold < 1.0:
+            raise ValueError(
+                "algorithm.bace.anchor_similarity_threshold must lie in (0, 1)"
+            )
         if self.tie_break_identity_mode not in AnchorIndex.IDENTITY_MODES:
             raise ValueError(
                 "algorithm.bace.tie_break_identity_mode must be "
@@ -265,6 +278,9 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                     invalid_action_mode=self.invalid_action_mode,
                     tie_break_identity_mode=self.tie_break_identity_mode,
                     capacity_correction_batch_size=self.capacity_correction_batch_size,
+                    anchor_similarity_enabled=self.anchor_similarity_enabled,
+                    anchor_similarity_threshold=self.anchor_similarity_threshold,
+                    allow_initial_search_anchor=self.allow_initial_search_anchor,
                 )
             else:
                 self.topology_planner = DynamicTopologyPlanner(
@@ -313,6 +329,9 @@ class BaceTrajectoryCollector(TrajectoryCollector):
                 tie_break_identity_mode=self.tie_break_identity_mode,
                 pairwise_mode=self.pairwise_mode,
                 pairwise_batch_size=self.pairwise_batch_size,
+                anchor_similarity_enabled=self.anchor_similarity_enabled,
+                anchor_similarity_threshold=self.anchor_similarity_threshold,
+                allow_initial_search_anchor=self.allow_initial_search_anchor,
             )
         else:
             raise ValueError(f"Unknown BACE acquisition mode: {self.acquisition}")
@@ -403,6 +422,13 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             self.parameter_signature["tie_break_identity_mode"] = (
                 self.tie_break_identity_mode
             )
+        if self.anchor_similarity_enabled:
+            self.parameter_signature.update({
+                "anchor_similarity_enabled": True,
+                "anchor_similarity_threshold": self.anchor_similarity_threshold,
+            })
+        if self.allow_initial_search_anchor:
+            self.parameter_signature["allow_initial_search_anchor"] = True
         # Tree credit only changes the learner-side use of a completed rollout.
         # It deliberately stays outside the controller/history signature so the
         # four variants can fork from one identical BACE checkpoint, as required
@@ -570,6 +596,9 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             },
             "invalid_action_mode": self.invalid_action_mode,
             "tie_break_identity_mode": self.tie_break_identity_mode,
+            "anchor_similarity_enabled": self.anchor_similarity_enabled,
+            "anchor_similarity_threshold": self.anchor_similarity_threshold,
+            "allow_initial_search_anchor": self.allow_initial_search_anchor,
             "local_credit_mode": str(self.config.algorithm.bace.local_credit_mode),
             "credit_mode": self.credit_mode,
             "tree_credit_mode": self.tree_credit_mode,
@@ -585,6 +614,9 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             "max_branches_per_anchor": int(self.config.algorithm.bace.max_branches_per_anchor),
             "min_natural_roots": int(self.config.algorithm.bace.get("min_natural_roots", 2)),
             "quota_policy": self.quota_policy,
+            "competence_threshold": float(
+                self.config.algorithm.bace.get("competence_threshold", 0.5)
+            ),
             "batch_erv_threshold": float(self.config.algorithm.bace.get("batch_erv_threshold", 0.0)),
             "batch_erv_tie_abs_tolerance": float(
                 self.config.algorithm.bace.get("batch_erv_tie_abs_tolerance", 1e-12)
@@ -649,6 +681,15 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             invalid_action_mode=getattr(self, "invalid_action_mode", "strict_identity"),
             tie_break_identity_mode=getattr(
                 self, "tie_break_identity_mode", "legacy_uuid"
+            ),
+            anchor_similarity_enabled=getattr(
+                self, "anchor_similarity_enabled", False
+            ),
+            anchor_similarity_threshold=getattr(
+                self, "anchor_similarity_threshold", 0.9
+            ),
+            allow_initial_search_anchor=getattr(
+                self, "allow_initial_search_anchor", False
             ),
         )
         candidate_action_counts = []
@@ -776,11 +817,21 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             tie_break_identity_mode=getattr(
                 self, "tie_break_identity_mode", "legacy_uuid"
             ),
+            anchor_similarity_enabled=getattr(
+                self, "anchor_similarity_enabled", False
+            ),
+            anchor_similarity_threshold=getattr(
+                self, "anchor_similarity_threshold", 0.9
+            ),
+            allow_initial_search_anchor=getattr(
+                self, "allow_initial_search_anchor", False
+            ),
         )
         candidates = []
-        for anchor in index.anchors_for_task(request.task_id):
-            if repr(anchor.anchor_key) != repr(request.expected_anchor_key):
-                continue
+        matched_anchor = index.anchor_for_observation(
+            request.task_id, request.expected_anchor_key
+        )
+        for anchor in ([matched_anchor] if matched_anchor is not None else []):
             candidates.extend(anchor.origins_by_action.get(request.selected_canonical_action, []))
         candidates = index.ordered_origins(candidates)
         origin = next((item for item in candidates if item.occurrence_id not in used_occurrences), None)
@@ -1450,13 +1501,19 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             batch.non_tensor_batch["action_identity"] = np.asarray(
                 [info.get("action_identity") for info in infos], dtype=object
             )
+            batch.non_tensor_batch["action_identity_kind"] = np.asarray(
+                [info.get("action_identity_kind") for info in infos], dtype=object
+            )
             batch.non_tensor_batch["post_action_observation"] = np.asarray(
                 next_obs.get("anchor", [None for _ in range(active_size)]),
                 dtype=object,
             )
             batch.non_tensor_batch["environment_reset_key"] = np.asarray(
                 [
-                    info.get("extra.gamefile", info.get("session_idx", ""))
+                    info.get(
+                        "environment_reset_key",
+                        info.get("extra.gamefile", info.get("session_idx", "")),
+                    )
                     for info in infos
                 ],
                 dtype=object,
@@ -1554,10 +1611,30 @@ class BaceTrajectoryCollector(TrajectoryCollector):
 
     @staticmethod
     def _reset_key_from_info(info):
-        reset_key = info.get("extra.gamefile", info.get("session_idx"))
+        reset_key = info.get(
+            "environment_reset_key",
+            info.get("extra.gamefile", info.get("session_idx")),
+        )
         if reset_key is None or str(reset_key) == "":
             raise ValueError("Staged packed root generation could not resolve an environment reset key")
         return str(reset_key)
+
+    def _staged_probe_reset_options(self, gen_batch, worker_indices):
+        """Return the environment-specific input required for a root-key probe."""
+        options = {
+            "_bace_worker_indices": list(worker_indices),
+            "_bace_reset_keys": [None] * len(worker_indices),
+        }
+        env_name = str(getattr(getattr(self.config, "env", None), "env_name", "")).lower()
+        if "search" not in env_name:
+            return options
+        specs = gen_batch.non_tensor_batch.get("env_kwargs")
+        if specs is None:
+            raise ValueError("Search staged roots require parquet env_kwargs")
+        if len(specs) != len(worker_indices):
+            raise ValueError("Search staged probe specs must match logical tasks")
+        options["_bace_reset_specs"] = [specs[index] for index in range(len(worker_indices))]
+        return options
 
     def _record_root_wave(self, phase, batch_size, elapsed):
         prefix = f"{phase}_root"
@@ -1586,12 +1663,10 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         root_logs = []
 
         probe_started = time.monotonic()
-        _, probe_infos = envs.reset(kwargs={
-            "_bace_worker_indices": [
-                task_idx * physical_stride for task_idx in task_indices
-            ],
-            "_bace_reset_keys": [None] * task_count,
-        })
+        _, probe_infos = envs.reset(kwargs=self._staged_probe_reset_options(
+            gen_batch,
+            [task_idx * physical_stride for task_idx in task_indices],
+        ))
         reset_key_by_task = {
             task_idx: self._reset_key_from_info(info)
             for task_idx, info in zip(task_indices, probe_infos)
@@ -1791,12 +1866,10 @@ class BaceTrajectoryCollector(TrajectoryCollector):
         root_logs = []
 
         probe_started = time.monotonic()
-        _, probe_infos = envs.reset(kwargs={
-            "_bace_worker_indices": [
-                task_idx * physical_stride for task_idx in task_indices
-            ],
-            "_bace_reset_keys": [None] * task_count,
-        })
+        _, probe_infos = envs.reset(kwargs=self._staged_probe_reset_options(
+            gen_batch,
+            [task_idx * physical_stride for task_idx in task_indices],
+        ))
         reset_key_by_task = {
             task_idx: self._reset_key_from_info(info)
             for task_idx, info in zip(task_indices, probe_infos)
@@ -2110,6 +2183,9 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             )
             batch.non_tensor_batch["action_identity"] = np.array(
                 [info.get("action_identity") for info in infos], dtype=object
+            )
+            batch.non_tensor_batch["action_identity_kind"] = np.array(
+                [info.get("action_identity_kind") for info in infos], dtype=object
             )
             batch.non_tensor_batch["post_action_observation"] = np.array(next_obs["anchor"], dtype=object)
             batch.non_tensor_batch["environment_reset_key"] = np.array(
@@ -2473,6 +2549,9 @@ class BaceTrajectoryCollector(TrajectoryCollector):
             )
             batch.non_tensor_batch["action_identity"] = np.asarray(
                 [info.get("action_identity") for info in infos], dtype=object
+            )
+            batch.non_tensor_batch["action_identity_kind"] = np.asarray(
+                [info.get("action_identity_kind") for info in infos], dtype=object
             )
             batch.non_tensor_batch["post_action_observation"] = np.asarray(
                 next_obs["anchor"], dtype=object

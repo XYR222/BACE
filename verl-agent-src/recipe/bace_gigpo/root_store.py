@@ -14,6 +14,8 @@ def _active_values(values, mask) -> tuple:
 
 
 def task_family_from_reset_key(reset_key: str) -> str:
+    if str(reset_key).startswith("search-v1:"):
+        return "search"
     families = (
         "pick_and_place",
         "pick_two_obj_and_place",
@@ -101,8 +103,13 @@ def build_root_event_logs(batch) -> list[RootEventLog]:
             action_identity = resolve_action_identity(
                 action_identity, action, format_valid, environment_valid
             )
+            identity_kind_values = batch.non_tensor_batch.get("action_identity_kind")
             identity_kind = (
-                "unparsed" if not format_valid else ("valid" if environment_valid else "invalid")
+                str(identity_kind_values[idx])
+                if identity_kind_values is not None and identity_kind_values[idx] is not None
+                else "unparsed" if not format_valid
+                else "valid" if environment_valid
+                else "invalid"
             )
             events.append(
                 RootEvent(

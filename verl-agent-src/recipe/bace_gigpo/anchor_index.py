@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections import defaultdict
 
-from gigpo.core_gigpo import to_hashable
+from gigpo.core_gigpo import are_similar, to_hashable
 
 from .types import AnchorRecord, OriginOccurrence, RootEvent, RootEventLog
 
@@ -18,6 +18,9 @@ class AnchorIndex:
         roots: list[RootEventLog],
         invalid_action_mode: str = "strict_identity",
         tie_break_identity_mode: str = "legacy_uuid",
+        anchor_similarity_enabled: bool = False,
+        anchor_similarity_threshold: float = 0.9,
+        allow_initial_search_anchor: bool = False,
     ):
         if invalid_action_mode not in {"strict_identity", "valid_only_branch", "single_invalid_bucket"}:
             raise ValueError(f"Unknown invalid action mode: {invalid_action_mode}")
@@ -27,6 +30,11 @@ class AnchorIndex:
             )
         self.invalid_action_mode = invalid_action_mode
         self.tie_break_identity_mode = tie_break_identity_mode
+        self.anchor_similarity_enabled = bool(anchor_similarity_enabled)
+        self.anchor_similarity_threshold = float(anchor_similarity_threshold)
+        self.allow_initial_search_anchor = bool(allow_initial_search_anchor)
+        if self.anchor_similarity_enabled and not 0.0 < self.anchor_similarity_threshold < 1.0:
+            raise ValueError("anchor_similarity_threshold must lie in (0, 1)")
         self.roots = {root.root_id: root for root in roots}
         self.events = {
             event.occurrence_id: event
@@ -110,6 +118,10 @@ class AnchorIndex:
     def _statistical_action_id(self, event: RootEvent) -> str | None:
         if not event.action_format_valid:
             return None
+        # Search ANSWER is a real terminal training action but not a repeatable
+        # information-acquisition experiment.
+        if event.action_identity_kind == "terminal":
+            return None
         identity = event.action_identity or event.canonical_action
         if not identity or identity == "INVALID":
             return None
@@ -126,45 +138,80 @@ class AnchorIndex:
         return hashlib.sha256(payload).hexdigest()[:20]
 
     def _build(self, roots: list[RootEventLog]) -> dict[str, AnchorRecord]:
-        grouped: dict[tuple[str, object], list[tuple[RootEventLog, RootEvent]]] = defaultdict(list)
+        clusters: dict[str, list[dict[str, object]]] = defaultdict(list)
         for root in roots:
             for event in root.events:
-                if event.step_index == 0:
+                if event.step_index == 0 and not (
+                    self.allow_initial_search_anchor and root.task_family == "search"
+                ):
                     continue
                 if self._statistical_action_id(event) is None:
                     continue
-                grouped[(root.task_id, to_hashable(event.pre_action_observation))].append((root, event))
+                anchor_key = event.pre_action_observation
+                cluster = None
+                for candidate in clusters[root.task_id]:
+                    representative = candidate["anchor_key"]
+                    matches = (
+                        are_similar(
+                            anchor_key,
+                            representative,
+                            self.anchor_similarity_threshold,
+                        )
+                        if self.anchor_similarity_enabled
+                        else to_hashable(anchor_key) == to_hashable(representative)
+                    )
+                    if matches:
+                        cluster = candidate
+                        break
+                if cluster is None:
+                    cluster = {"anchor_key": anchor_key, "occurrences": []}
+                    clusters[root.task_id].append(cluster)
+                cluster["occurrences"].append((root, event))
 
         anchors = {}
-        for (task_id, anchor_key), occurrences in grouped.items():
-            actions = sorted({self._statistical_action_id(event) for _, event in occurrences})
-            if len(occurrences) < 2 or len(actions) < 2:
-                continue
-            anchor_id = self._anchor_id(
-                self._decision_key_by_task[task_id], anchor_key
-            )
-            record = AnchorRecord(
-                task_id=task_id,
-                anchor_id=anchor_id,
-                anchor_key=anchor_key,
-                occurrence_ids=[event.occurrence_id for _, event in occurrences],
-                observed_action_ids=actions,
-            )
-            for root, event in occurrences:
-                action_id = self._statistical_action_id(event)
-                origin = OriginOccurrence(
-                    occurrence_id=event.occurrence_id,
-                    task_id=task_id,
-                    root_id=root.root_id,
-                    step_index=event.step_index,
-                    anchor_id=anchor_id,
-                    action_id=action_id,
-                    environment_reset_key=root.environment_reset_key,
-                    remaining_horizon=event.remaining_horizon,
+        for task_id, task_clusters in clusters.items():
+            for cluster in task_clusters:
+                anchor_key = cluster["anchor_key"]
+                occurrences = cluster["occurrences"]
+                actions = sorted({self._statistical_action_id(event) for _, event in occurrences})
+                if len(occurrences) < 2 or len(actions) < 2:
+                    continue
+                anchor_id = self._anchor_id(
+                    self._decision_key_by_task[task_id], anchor_key
                 )
-                record.origins_by_action.setdefault(action_id, []).append(origin)
-            anchors[anchor_id] = record
+                record = AnchorRecord(
+                    task_id=task_id,
+                    anchor_id=anchor_id,
+                    anchor_key=anchor_key,
+                    occurrence_ids=[event.occurrence_id for _, event in occurrences],
+                    observed_action_ids=actions,
+                )
+                for root, event in occurrences:
+                    action_id = self._statistical_action_id(event)
+                    origin = OriginOccurrence(
+                        occurrence_id=event.occurrence_id,
+                        task_id=task_id,
+                        root_id=root.root_id,
+                        step_index=event.step_index,
+                        anchor_id=anchor_id,
+                        action_id=action_id,
+                        environment_reset_key=root.environment_reset_key,
+                        remaining_horizon=event.remaining_horizon,
+                    )
+                    record.origins_by_action.setdefault(action_id, []).append(origin)
+                anchors[anchor_id] = record
         return anchors
+
+    def anchor_for_observation(self, task_id: str, observation):
+        for anchor in self.anchors_for_task(task_id):
+            if self.anchor_similarity_enabled:
+                if are_similar(
+                    observation, anchor.anchor_key, self.anchor_similarity_threshold
+                ):
+                    return anchor
+            elif to_hashable(observation) == to_hashable(anchor.anchor_key):
+                return anchor
+        return None
 
     def anchors_for_task(self, task_id: str) -> list[AnchorRecord]:
         return [record for record in self._anchors.values() if record.task_id == task_id]

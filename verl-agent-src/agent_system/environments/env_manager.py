@@ -25,8 +25,15 @@ from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory
 from omegaconf import OmegaConf
 from agent_system.environments.strict_actions import (
+    search_action_identity,
+    search_action_identity_kind,
+    search_action_is_executable,
     strict_action_identity,
     webshop_action_is_executable,
+)
+from agent_system.environments.env_package.search.replay_state import (
+    decode_search_reset_key,
+    encode_search_reset_key,
 )
 
 alfworld_action_identity = strict_action_identity
@@ -56,18 +63,47 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
     """
     def __init__(self, envs, projection_f, config):
         self.memory = SearchMemory()
+        self._reset_keys = []
+        self._bace_slots = {}
         super().__init__(envs, projection_f, config)
 
     def reset(self, kwargs) -> Tuple[Dict[str, Any], List[Dict]]:
-        obs, infos = self.envs.reset(kwargs=kwargs)
+        # Search tasks come from parquet rather than an environment-resident
+        # sampler.  A packed BACE root-key probe therefore has to carry the
+        # concrete question/ground-truth specs for its selected slots.
+        staged = (
+            kwargs if isinstance(kwargs, dict)
+            and "_bace_worker_indices" in kwargs else None
+        )
+        if staged is None:
+            specs = kwargs
+            obs, infos = self.envs.reset(kwargs=specs)
+        else:
+            worker_indices = staged["_bace_worker_indices"]
+            specs = staged.get("_bace_reset_specs")
+            if specs is None:
+                reset_keys = staged.get("_bace_reset_keys")
+                if reset_keys is None or any(key is None for key in reset_keys):
+                    raise ValueError(
+                        "Search staged reset requires concrete task specs or "
+                        "non-null search reset keys"
+                    )
+                specs = [decode_search_reset_key(str(key)) for key in reset_keys]
+            if len(worker_indices) != len(specs):
+                raise ValueError("Search staged reset workers must match task specs")
+            obs, infos = self.envs.reset_selected(worker_indices, specs)
         self.tasks = obs
+        self._reset_keys = [encode_search_reset_key(spec) for spec in specs]
+        for info, reset_key in zip(infos, self._reset_keys):
+            info["environment_reset_key"] = reset_key
 
         self.memory.reset(batch_size=len(obs))
 
         observations = {
             "text": self.build_text_obs(obs, init=True),
             "image": None,
-            "anchor": obs.copy()
+            "anchor": obs.copy(),
+            "admissible_actions": [tuple() for _ in obs],
         }
         
         return observations, infos
@@ -83,16 +119,164 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         next_observations = {
             "text": self.build_text_obs(next_obs),
             "image": None,
-            "anchor": next_obs.copy()
+            "anchor": next_obs.copy(),
+            "admissible_actions": [tuple() for _ in next_obs],
         }
         
         for i, info in enumerate(infos):
-            info["is_action_valid"] = to_numpy(valids[i])
+            format_valid = bool(valids[i])
+            environment_valid = format_valid
+            info["is_action_valid"] = to_numpy(format_valid)
+            info["is_action_format_valid"] = to_numpy(format_valid)
+            info["is_action_environment_valid"] = to_numpy(environment_valid)
+            info["projected_action"] = actions[i]
+            info["action_identity"] = search_action_identity(
+                text_actions[i], actions[i], format_valid, environment_valid
+            )
+            info["action_identity_kind"] = search_action_identity_kind(
+                actions[i], format_valid
+            )
+            info["environment_reset_key"] = self._reset_keys[i]
 
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
         return next_observations, rewards, dones, infos
+
+    def is_action_executable(self, action, action_pool=()):
+        return search_action_is_executable(action, action_pool)
+
+    def _selected_indices(self, worker_indices, *, operation):
+        indices = [int(index) for index in worker_indices]
+        if not indices or len(indices) != len(set(indices)):
+            raise ValueError(f"{operation} requires non-empty unique Search workers")
+        capacity = int(self.envs.num_processes)
+        if min(indices) < 0 or max(indices) >= capacity:
+            raise ValueError(
+                f"{operation} worker index must be in [0, {capacity}), got {indices}"
+            )
+        return indices
+
+    @staticmethod
+    def _history_context(history, history_length):
+        recent = history[-history_length:]
+        start_idx = len(history) - len(recent)
+        return "".join(
+            f"Step {start_idx + offset + 1}:{record['search']} "
+            f"{record['information']}\n"
+            for offset, record in enumerate(recent)
+        )
+
+    def _build_selected_prompt(self, state, init=False):
+        history = state["history"]
+        if init or self.config.env.history_length <= 0 or not history:
+            return SEARCH_TEMPLATE_NO_HIS.format(task_description=state["task"])
+        return SEARCH_TEMPLATE.format(
+            task_description=state["task"],
+            step_count=len(history),
+            memory_context=self._history_context(
+                history, int(self.config.env.history_length)
+            ),
+        )
+
+    def _selected_observations(self, worker_indices, init=False):
+        states = [self._bace_slots[int(index)] for index in worker_indices]
+        return {
+            "text": [self._build_selected_prompt(state, init=init) for state in states],
+            "image": None,
+            "anchor": [state["text_obs"] for state in states],
+            "admissible_actions": [tuple() for _ in states],
+        }
+
+    def reset_selected(self, worker_indices, reset_keys=None):
+        indices = self._selected_indices(worker_indices, operation="reset_selected")
+        if reset_keys is None or len(reset_keys) != len(indices):
+            raise ValueError("Search reset keys must match selected workers")
+        specs = [decode_search_reset_key(str(key)) for key in reset_keys]
+        observations, infos = self.envs.reset_selected(indices, specs)
+        for index, observation, info, reset_key in zip(
+            indices, observations, infos, reset_keys
+        ):
+            info["environment_reset_key"] = str(reset_key)
+            self._bace_slots[index] = {
+                "task": observation,
+                "text_obs": observation,
+                "reset_key": str(reset_key),
+                "history": [],
+                "done": False,
+            }
+        return self._selected_observations(indices, init=True), infos
+
+    def get_observations_selected(self, worker_indices):
+        indices = self._selected_indices(
+            worker_indices, operation="get_observations_selected"
+        )
+        return self._selected_observations(indices)
+
+    def get_tasks_selected(self, worker_indices):
+        indices = self._selected_indices(worker_indices, operation="get_tasks_selected")
+        return [self._bace_slots[index]["task"] for index in indices]
+
+    def step_selected(self, worker_indices, text_actions):
+        indices = self._selected_indices(worker_indices, operation="step_selected")
+        if len(indices) != len(text_actions):
+            raise ValueError("Search actions must match selected workers")
+        states = [self._bace_slots[index] for index in indices]
+        if any(state["done"] for state in states):
+            raise RuntimeError("Cannot step a completed Search worker")
+        actions, valids = self.projection_f(text_actions)
+        observations, rewards, dones, infos = self.envs.step_selected(indices, actions)
+        for state, observation, done, info, raw, action, valid in zip(
+            states, observations, dones, infos, text_actions, actions, valids
+        ):
+            format_valid = bool(valid)
+            state["history"].append({"search": action, "information": observation})
+            state["text_obs"] = observation
+            state["done"] = bool(done)
+            info["is_action_valid"] = to_numpy(format_valid)
+            info["is_action_format_valid"] = to_numpy(format_valid)
+            info["is_action_environment_valid"] = to_numpy(format_valid)
+            info["projected_action"] = action
+            info["action_identity"] = search_action_identity(
+                raw, action, format_valid, format_valid
+            )
+            info["action_identity_kind"] = search_action_identity_kind(
+                action, format_valid
+            )
+            info["environment_reset_key"] = state["reset_key"]
+        return (
+            self._selected_observations(indices),
+            to_numpy(rewards),
+            to_numpy(dones),
+            infos,
+        )
+
+    def replay_selected(self, worker_indices, requests):
+        indices = self._selected_indices(worker_indices, operation="replay_selected")
+        if len(indices) != len(requests):
+            raise ValueError("Search workers must match replay requests")
+        _, reset_infos = self.reset_selected(
+            indices, [request.environment_reset_key for request in requests]
+        )
+        last_infos = list(reset_infos)
+        dones = [False] * len(indices)
+        prefixes = [list(request.parsed_action_prefix) for request in requests]
+        for turn in range(max((len(prefix) for prefix in prefixes), default=0)):
+            positions = [pos for pos, prefix in enumerate(prefixes) if turn < len(prefix)]
+            active_indices = [indices[pos] for pos in positions]
+            actions = [prefixes[pos][turn] for pos in positions]
+            _, _, turn_dones, turn_infos = self.step_selected(active_indices, actions)
+            for pos, done, info in zip(positions, turn_dones, turn_infos):
+                dones[pos] = bool(done)
+                last_infos[pos] = info
+                if done and turn < len(prefixes[pos]) - 1:
+                    raise RuntimeError(
+                        f"Search replay terminated before prefix end at turn {turn}"
+                    )
+        return self._selected_observations(indices), np.asarray(dones), last_infos
+
+    def replay(self, requests):
+        return self.replay_selected(list(range(len(requests))), requests)
 
     def build_text_obs(
         self,

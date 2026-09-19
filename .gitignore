@@ -40,6 +40,8 @@
 **/*.err
 **/*.pid
 **/*.lock
+**/smoke-logs/
+**/output_*.txt
 
 # Crash dumps and profiling products
 **/core

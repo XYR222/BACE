@@ -9,3 +9,17 @@ cd work-BACE/verl-agent-src
 DRY_RUN=1 BACE_RUN_NAME=dry_c8_corr1 bash examples/bace_gigpo/c8_tree_credit_corr1_2gpu/run_c8_corr1_2gpu.sh
 bash examples/bace_gigpo/c8_tree_credit_corr1_2gpu/submit_seeds_0_1_2.sh
 ```
+
+WebShop 使用独立入口：保留已验证的 WebShop-1k 环境、PPO 参数和分层保存布局，
+只把 BACE credit 固定为 C8 并把 capacity correction 固定为 1。
+
+```bash
+cd work-BACE/verl-agent-src
+DRY_RUN=1 BACE_RUN_NAME=dry_webshop_c8_corr1 \
+  bash examples/bace_gigpo/c8_tree_credit_corr1_2gpu/run_webshop_c8_corr1_2gpu.sbatch
+bash examples/bace_gigpo/c8_tree_credit_corr1_2gpu/submit_webshop_seed0.sh
+```
+
+正式 run 的 artifacts、rollouts、metadata、trace 在
+`experiments/webshop1k-qwen2.5-1.5b-exact/runs/<run>/`；checkpoint、
+TensorBoard 分别在同一实验根的 `checkpoints/<run>/`、`tensorboard/<run>/`。

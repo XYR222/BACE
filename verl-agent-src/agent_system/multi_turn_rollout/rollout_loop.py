@@ -425,12 +425,18 @@ class TrajectoryCollector:
                 batch.non_tensor_batch['action_identity'] = np.array(
                     [info.get('action_identity') for info in infos], dtype=object
                 )
+                batch.non_tensor_batch['action_identity_kind'] = np.array(
+                    [info.get('action_identity_kind') for info in infos], dtype=object
+                )
                 batch.non_tensor_batch['post_action_observation'] = np.array(
                     next_obs.get('anchor', [None for _ in range(batch_size)]), dtype=object
                 )
                 batch.non_tensor_batch['environment_reset_key'] = np.array(
                     [
-                        info.get('extra.gamefile', info.get('session_idx', ''))
+                        info.get(
+                            'environment_reset_key',
+                            info.get('extra.gamefile', info.get('session_idx', '')),
+                        )
                         for info in infos
                     ], dtype=object
                 )

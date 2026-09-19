@@ -58,6 +58,22 @@ def make_branch_env(config):
         )
         return WebshopEnvironmentManager(raw_envs, partial(webshop_projection), config)
 
+    if "search" in env_name:
+        from agent_system.environments.env_manager import SearchEnvironmentManager
+        from agent_system.environments.env_package.search import (
+            build_search_envs,
+            search_projection,
+        )
+
+        raw_envs = build_search_envs(
+            seed=config.env.seed + 2000,
+            env_num=config.data.train_batch_size,
+            group_n=1,
+            is_train=True,
+            env_config=config.env,
+        )
+        return SearchEnvironmentManager(raw_envs, partial(search_projection), config)
+
     raise NotImplementedError(f"BACE replay does not support environment {config.env.env_name}")
 
 

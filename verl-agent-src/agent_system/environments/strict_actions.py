@@ -7,6 +7,9 @@ from typing import Sequence
 
 
 _WEBSHOP_ACTION_PATTERN = re.compile(r"(.+)\[(.+)\]")
+_SEARCH_BLOCK_PATTERN = re.compile(
+    r"^<(search|answer)>(.*?)</\1>$", re.IGNORECASE | re.DOTALL
+)
 
 
 def parse_tagged_action_response(response: str):
@@ -83,3 +86,45 @@ def webshop_action_is_executable(action: str, action_pool: Sequence[str]) -> boo
         if parsed_name == "click" and parsed_arg is not None
     }
     return action_name == "click" and action_arg in clickable_args
+
+
+def parse_search_environment_action(action: str):
+    """Parse the exact structured action emitted by ``search_projection``."""
+    if not isinstance(action, str):
+        return None, None
+    match = _SEARCH_BLOCK_PATTERN.fullmatch(action.strip())
+    if match is None:
+        return None, None
+    action_type = match.group(1).lower()
+    payload = match.group(2).strip()
+    if not payload:
+        return None, None
+    return action_type, payload
+
+
+def search_action_identity(response: str, projected_action: str,
+                           format_valid: bool, environment_valid: bool):
+    """Return exact executed-query/answer identity; CoT is intentionally ignored."""
+    if not format_valid or not environment_valid:
+        return None
+    action_type, payload = parse_search_environment_action(projected_action)
+    if action_type is None:
+        return None
+    return f"valid::<{action_type}>{payload}</{action_type}>"
+
+
+def search_action_identity_kind(projected_action: str, format_valid: bool) -> str:
+    if not format_valid:
+        return "unparsed"
+    action_type, _ = parse_search_environment_action(projected_action)
+    if action_type == "search":
+        return "valid"
+    if action_type == "answer":
+        return "terminal"
+    return "unparsed"
+
+
+def search_action_is_executable(action: str, _action_pool: Sequence[str] = ()) -> bool:
+    """Only non-terminal SEARCH calls are eligible for targeted replay."""
+    action_type, payload = parse_search_environment_action(action)
+    return action_type == "search" and bool(payload)

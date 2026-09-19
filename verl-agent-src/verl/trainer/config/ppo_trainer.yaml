@@ -311,6 +311,11 @@ algorithm:
     tree_ppo_padding_mode: copy_trainable  # copy_trainable aligns C1/C2/C3 batching with upstream GiGPO/C0; zero_loss is retained as an ablation
     invalid_action_mode: strict_identity  # strict_identity | valid_only_branch | single_invalid_bucket
     tie_break_identity_mode: legacy_uuid  # legacy_uuid preserves active runs; stable_v1 is deterministic across UUID changes
+    anchor_similarity_enabled: false  # Search mainline: true, aligned with GiGPO state grouping
+    anchor_similarity_threshold: 0.9
+    # Search's first generated tool call is a real, replayable decision.  Keep
+    # the historical step-0 exclusion for every other environment.
+    allow_initial_search_anchor: false
     artifacts:
       enabled: True
       directory: null  # defaults to rollout_data_dir/bace_trace or default_local_dir/bace_trace
